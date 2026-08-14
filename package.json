@@ -1,0 +1,6 @@
+{
+  "name": "dokumenthub",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Persönliches Dokumentenablage-System mit KI-Erkennung und OneDrive-Anbindung"
+}

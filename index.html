@@ -1,0 +1,360 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>DokumentHub</title>
+
+<!-- iPhone: als Vollbild-App vom Homescreen startbar -->
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="apple-mobile-web-app-title" content="DokumentHub" />
+<meta name="theme-color" content="#16233D" />
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,500;0,6..72,700;1,6..72,500&family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+<style>
+  html, body { margin: 0; padding: 0; background: #F4F3EF; }
+  * { box-sizing: border-box; }
+  #root { min-height: 100vh; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useRef, useCallback } = React;
+
+const KATEGORIEN = [
+  { id: "vermietung", label: "Vermietung", farbe: "#4B6455" },
+  { id: "rechnungen_steuer", label: "Rechnungen steuerrelevant", farbe: "#B23A34" },
+  { id: "rechnungen_privat", label: "Rechnungen nicht steuerrelevant", farbe: "#8A7B6C" },
+  { id: "steuer", label: "Steuer", farbe: "#16233D" },
+  { id: "versicherungen", label: "Versicherungen", farbe: "#3E5C76" },
+  { id: "bank", label: "Bank", farbe: "#2E6F5E" },
+  { id: "behoerden", label: "Behörden", farbe: "#6B4226" },
+  { id: "kleingewerbe", label: "Kleingewerbe", farbe: "#D98E3F" },
+  { id: "sonstiges", label: "Sonstiges", farbe: "#7A7A7A" },
+];
+
+const heute = () => {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`;
+};
+
+function slugify(text) {
+  return (text || "")
+    .trim()
+    .replace(/[äÄ]/g, "ae").replace(/[öÖ]/g, "oe").replace(/[üÜ]/g, "ue").replace(/ß/g, "ss")
+    .replace(/[^a-zA-Z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 60);
+}
+
+function b64ToBlob(base64, mediaType) {
+  const byteChars = atob(base64);
+  const byteNumbers = new Array(byteChars.length);
+  for (let i = 0; i < byteChars.length; i++) byteNumbers[i] = byteChars.charCodeAt(i);
+  return new Blob([new Uint8Array(byteNumbers)], { type: mediaType });
+}
+
+async function analysiereBeleg(base64Image, mediaType) {
+  const res = await fetch("/api/analyze", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ base64Image, mediaType }),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || "Analyse fehlgeschlagen");
+  return data;
+}
+
+async function graphGet(token, path) {
+  const res = await fetch(`https://graph.microsoft.com/v1.0${path}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) throw new Error(`Graph GET ${path} fehlgeschlagen (${res.status})`);
+  return res.json();
+}
+
+async function uploadZuOneDrive(token, pfad, dateiname, blob) {
+  const vollerPfad = `${pfad}${dateiname}`.split("/").filter(Boolean).join("/");
+  const encodedPfad = vollerPfad.split("/").map(encodeURIComponent).join("/");
+  const res = await fetch(`https://graph.microsoft.com/v1.0/me/drive/root:/${encodedPfad}:/content`, {
+    method: "PUT",
+    headers: { Authorization: `Bearer ${token}`, "Content-Type": blob.type || "application/octet-stream" },
+    body: blob,
+  });
+  if (!res.ok) {
+    const t = await res.text();
+    throw new Error(`Upload fehlgeschlagen (${res.status}): ${t.slice(0,200)}`);
+  }
+  return res.json();
+}
+
+// --- Microsoft Login (Implicit Flow, kein Server nötig) ---
+function starteMicrosoftLogin(clientId) {
+  const redirectUri = window.location.origin + window.location.pathname;
+  const scope = encodeURIComponent("Files.ReadWrite Files.ReadWrite.All User.Read offline_access");
+  const url = `https://login.microsoftonline.com/consumers/oauth2/v2.0/authorize` +
+    `?client_id=${encodeURIComponent(clientId)}` +
+    `&response_type=token` +
+    `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+    `&scope=${scope}` +
+    `&response_mode=fragment` +
+    `&nonce=${Date.now()}`;
+  window.localStorage.setItem("dh_client_id", clientId);
+  window.location.href = url;
+}
+
+function leseTokenAusUrl() {
+  if (!window.location.hash) return null;
+  const params = new URLSearchParams(window.location.hash.substring(1));
+  const token = params.get("access_token");
+  if (token) {
+    window.history.replaceState(null, "", window.location.pathname);
+    return token;
+  }
+  return null;
+}
+
+function FolderTab({ kategorie, active, onClick, count }) {
+  return (
+    <button onClick={onClick} style={{
+      background: active ? kategorie.farbe : "#EDEAE1",
+      color: active ? "#fff" : "#3A362E",
+      border: "none", borderRadius: "8px 8px 0 0", padding: "8px 14px",
+      fontFamily: "'IBM Plex Sans', sans-serif", fontSize: 12.5, fontWeight: 600,
+      cursor: "pointer", whiteSpace: "nowrap", position: "relative", top: active ? 0 : 3,
+    }}>
+      {kategorie.label}
+      {count > 0 && <span style={{ marginLeft: 6, opacity: 0.75, fontFamily: "'IBM Plex Mono', monospace", fontSize: 11 }}>{count}</span>}
+    </button>
+  );
+}
+
+function DokumentHub() {
+  const [ansicht, setAnsicht] = useState("scan");
+  const [status, setStatus] = useState("idle");
+  const [fehler, setFehler] = useState(null);
+  const [bildDaten, setBildDaten] = useState(null);
+  const [ergebnis, setErgebnis] = useState(null);
+  const [archiv, setArchiv] = useState([]);
+  const [filterKat, setFilterKat] = useState(null);
+  const fileInputRef = useRef(null);
+
+  const [clientId, setClientId] = useState(() => window.localStorage.getItem("dh_client_id") || "");
+  const [odToken, setOdToken] = useState(null);
+  const [odUser, setOdUser] = useState(null);
+  const [odStatus, setOdStatus] = useState("idle");
+  const [odFehler, setOdFehler] = useState(null);
+
+  useEffect(() => {
+    const token = leseTokenAusUrl();
+    if (token) {
+      setOdToken(token);
+      window.sessionStorage.setItem("dh_token", token);
+      setAnsicht("onedrive");
+    } else {
+      const gespeichert = window.sessionStorage.getItem("dh_token");
+      if (gespeichert) setOdToken(gespeichert);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!odToken) return;
+    setOdStatus("pruefe");
+    graphGet(odToken, "/me")
+      .then((me) => { setOdUser(me); setOdStatus("verbunden"); })
+      .catch(() => { setOdStatus("fehler"); setOdFehler("Anmeldung abgelaufen, bitte erneut einloggen."); setOdToken(null); window.sessionStorage.removeItem("dh_token"); });
+  }, [odToken]);
+
+  const handleDatei = useCallback((file) => {
+    if (!file) return;
+    setFehler(null); setErgebnis(null);
+    const reader = new FileReader();
+    reader.onload = async () => {
+      const result = reader.result;
+      const base64 = result.split(",")[1];
+      const mediaType = file.type || "image/jpeg";
+      setBildDaten({ base64, mediaType, previewUrl: result });
+      setStatus("analysiere"); setAnsicht("pruefen");
+      try {
+        const analyse = await analysiereBeleg(base64, mediaType);
+        setErgebnis(analyse); setStatus("fertig");
+      } catch (e) {
+        setFehler("Analyse fehlgeschlagen: " + e.message);
+        setErgebnis({ kategorie_id: "sonstiges", dokumenttyp: "", absender: "", betrag: null, datum: heute(), zusammenfassung: "", vorgeschlagener_dateiname: `${heute()}_Dokument` });
+        setStatus("fertig");
+      }
+    };
+    reader.readAsDataURL(file);
+  }, []);
+
+  const jetztAblegen = async () => {
+    if (!ergebnis) return;
+    const kat = KATEGORIEN.find(k => k.id === ergebnis.kategorie_id) || KATEGORIEN[8];
+    const dateiname = slugify(ergebnis.vorgeschlagener_dateiname) + ".jpg";
+    const pfad = `DokumentHub/${(ergebnis.datum || heute()).slice(0,4)}/${kat.label}/`;
+    const id = Date.now();
+    const eintrag = { id, ...ergebnis, kategorie: kat, dateiname, previewUrl: bildDaten.previewUrl, pfad, abgelegtAm: new Date().toLocaleString("de-DE"), oneDriveStatus: odStatus === "verbunden" ? "laedt_hoch" : "nicht_verbunden" };
+    setArchiv(prev => [eintrag, ...prev]);
+    const bildLokal = bildDaten;
+    setBildDaten(null); setErgebnis(null); setStatus("idle"); setAnsicht("archiv");
+
+    if (odStatus === "verbunden" && odToken) {
+      try {
+        const blob = b64ToBlob(bildLokal.base64, bildLokal.mediaType);
+        await uploadZuOneDrive(odToken, pfad, dateiname, blob);
+        setArchiv(prev => prev.map(e => e.id === id ? { ...e, oneDriveStatus: "ok" } : e));
+      } catch (e) {
+        setArchiv(prev => prev.map(e => e.id === id ? { ...e, oneDriveStatus: "fehler" } : e));
+      }
+    }
+  };
+
+  const verwerfen = () => { setBildDaten(null); setErgebnis(null); setStatus("idle"); setFehler(null); setAnsicht("scan"); };
+
+  const gefiltertesArchiv = filterKat ? archiv.filter(e => e.kategorie.id === filterKat) : archiv;
+
+  return (
+    <div style={{ fontFamily: "'IBM Plex Sans', sans-serif", background: "#F4F3EF", minHeight: "100vh", maxWidth: 480, margin: "0 auto", color: "#22201B" }}>
+      <style>{`
+        .btn-primary { background:#16233D; color:#F4F3EF; border:none; border-radius:10px; padding:14px 20px; font-family:'IBM Plex Sans',sans-serif; font-weight:600; font-size:15px; cursor:pointer; width:100%; }
+        .btn-primary:disabled { opacity:0.5; }
+        .btn-secondary { background:transparent; color:#16233D; border:1.5px solid #16233D; border-radius:10px; padding:13px 20px; font-family:'IBM Plex Sans',sans-serif; font-weight:600; font-size:15px; cursor:pointer; width:100%; }
+        .field-label { font-size:11px; text-transform:uppercase; letter-spacing:0.06em; color:#7A7566; font-weight:600; margin-bottom:4px; display:block; }
+        .field-input { width:100%; padding:10px 12px; border:1.5px solid #DCD8CC; border-radius:8px; font-family:'IBM Plex Sans',sans-serif; font-size:14.5px; background:#fff; color:#22201B; }
+        .mono { font-family:'IBM Plex Mono', monospace; }
+      `}</style>
+
+      <div style={{ padding: "22px 20px 16px", borderBottom: "1px solid #E4E1D6" }}>
+        <div style={{ fontFamily: "'Newsreader', serif", fontSize: 26, fontWeight: 700 }}>DokumentHub</div>
+        <div style={{ fontSize: 13, color: "#7A7566", marginTop: 2 }}>Scan · Erkennung · Ablage</div>
+        <div style={{ display: "flex", gap: 8, marginTop: 16, flexWrap: "wrap" }}>
+          {[{ id: "scan", label: "Scannen" }, { id: "archiv", label: `Archiv (${archiv.length})` }, { id: "onedrive", label: odStatus === "verbunden" ? "OneDrive ●" : "OneDrive" }].map(tab => (
+            <button key={tab.id} onClick={() => setAnsicht(tab.id)} style={{
+              background: ansicht === tab.id ? "#16233D" : "transparent", color: ansicht === tab.id ? "#F4F3EF" : "#16233D",
+              border: "1.5px solid #16233D", borderRadius: 20, padding: "6px 14px", fontSize: 13, fontWeight: 600, cursor: "pointer",
+            }}>{tab.label}</button>
+          ))}
+        </div>
+      </div>
+
+      {ansicht === "scan" && (
+        <div style={{ padding: 20 }}>
+          <div style={{ border: "2px dashed #C9C4B4", borderRadius: 16, padding: "48px 20px", textAlign: "center", background: "#FBFAF7" }}>
+            <div style={{ fontSize: 40, marginBottom: 12 }}>📄</div>
+            <div style={{ fontWeight: 600, marginBottom: 6, fontSize: 15 }}>Dokument fotografieren</div>
+            <div style={{ fontSize: 13, color: "#9A9484", marginBottom: 20 }}>JPG, PNG · Kamera oder Fotomediathek</div>
+            <input ref={fileInputRef} type="file" accept="image/*" capture="environment" style={{ display: "none" }} onChange={e => handleDatei(e.target.files[0])} />
+            <button className="btn-primary" onClick={() => fileInputRef.current?.click()}>Kamera öffnen</button>
+          </div>
+        </div>
+      )}
+
+      {ansicht === "pruefen" && (
+        <div style={{ padding: 20 }}>
+          {bildDaten && <img src={bildDaten.previewUrl} alt="Scan" style={{ width: "100%", borderRadius: 12, marginBottom: 16, border: "1px solid #E4E1D6" }} />}
+          {status === "analysiere" && <div style={{ textAlign: "center", padding: "30px 0", color: "#7A7566" }} className="mono">Analysiere Dokument …</div>}
+          {status === "fertig" && ergebnis && (
+            <div>
+              {fehler && <div style={{ background: "#FBEAE8", color: "#B23A34", padding: 10, borderRadius: 8, fontSize: 13, marginBottom: 14 }}>{fehler}</div>}
+              <div style={{ marginBottom: 14 }}>
+                <span className="field-label">Kategorie</span>
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 6 }}>
+                  {KATEGORIEN.map(k => (
+                    <button key={k.id} onClick={() => setErgebnis({ ...ergebnis, kategorie_id: k.id })} style={{
+                      background: ergebnis.kategorie_id === k.id ? k.farbe : "#EDEAE1", color: ergebnis.kategorie_id === k.id ? "#fff" : "#3A362E",
+                      border: "none", borderRadius: 6, padding: "6px 10px", fontSize: 12, fontWeight: 600, cursor: "pointer",
+                    }}>{k.label}</button>
+                  ))}
+                </div>
+              </div>
+              <div style={{ marginBottom: 12 }}>
+                <span className="field-label">Dateiname (ohne Endung)</span>
+                <input className="field-input mono" value={ergebnis.vorgeschlagener_dateiname || ""} onChange={e => setErgebnis({ ...ergebnis, vorgeschlagener_dateiname: e.target.value })} />
+              </div>
+              <div style={{ display: "flex", gap: 10, marginBottom: 12 }}>
+                <div style={{ flex: 1 }}><span className="field-label">Dokumenttyp</span><input className="field-input" value={ergebnis.dokumenttyp || ""} onChange={e => setErgebnis({ ...ergebnis, dokumenttyp: e.target.value })} /></div>
+                <div style={{ flex: 1 }}><span className="field-label">Datum</span><input className="field-input" value={ergebnis.datum || ""} onChange={e => setErgebnis({ ...ergebnis, datum: e.target.value })} /></div>
+              </div>
+              <div style={{ display: "flex", gap: 10, marginBottom: 18 }}>
+                <div style={{ flex: 1 }}><span className="field-label">Absender</span><input className="field-input" value={ergebnis.absender || ""} onChange={e => setErgebnis({ ...ergebnis, absender: e.target.value })} /></div>
+                <div style={{ flex: 1 }}><span className="field-label">Betrag</span><input className="field-input" value={ergebnis.betrag || ""} onChange={e => setErgebnis({ ...ergebnis, betrag: e.target.value })} /></div>
+              </div>
+              <div style={{ display: "flex", gap: 10 }}>
+                <button className="btn-secondary" onClick={verwerfen}>Verwerfen</button>
+                <button className="btn-primary" onClick={jetztAblegen}>In Archiv ablegen</button>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {ansicht === "onedrive" && (
+        <div style={{ padding: 20 }}>
+          <div style={{ fontFamily: "'Newsreader', serif", fontSize: 18, fontWeight: 700, marginBottom: 14 }}>OneDrive-Verbindung</div>
+
+          {odStatus === "verbunden" && odUser ? (
+            <div style={{ background: "#EAF2EE", color: "#2E6F5E", padding: 12, borderRadius: 8, fontSize: 13.5 }}>
+              ✓ Verbunden als {odUser.displayName || odUser.userPrincipalName}
+            </div>
+          ) : (
+            <div>
+              <span className="field-label">Azure App Client-ID</span>
+              <input className="field-input mono" value={clientId} onChange={e => setClientId(e.target.value)} placeholder="z.B. 3f8a1c9e-..." style={{ marginBottom: 12 }} />
+              <button className="btn-primary" disabled={!clientId.trim()} onClick={() => starteMicrosoftLogin(clientId.trim())}>Mit Microsoft anmelden</button>
+              {odFehler && <div style={{ background: "#FBEAE8", color: "#B23A34", padding: 10, borderRadius: 8, fontSize: 13, marginTop: 12 }}>{odFehler}</div>}
+            </div>
+          )}
+        </div>
+      )}
+
+      {ansicht === "archiv" && (
+        <div>
+          <div style={{ display: "flex", gap: 4, overflowX: "auto", padding: "12px 16px 0" }}>
+            <FolderTab kategorie={{ farbe: "#16233D", label: "Alle" }} active={!filterKat} onClick={() => setFilterKat(null)} count={archiv.length} />
+            {KATEGORIEN.map(k => {
+              const count = archiv.filter(e => e.kategorie.id === k.id).length;
+              if (count === 0) return null;
+              return <FolderTab key={k.id} kategorie={k} active={filterKat === k.id} onClick={() => setFilterKat(k.id)} count={count} />;
+            })}
+          </div>
+          <div style={{ background: "#fff", margin: "0 16px 16px", borderRadius: "0 12px 12px 12px", border: "1px solid #E4E1D6", overflow: "hidden" }}>
+            {gefiltertesArchiv.length === 0 ? (
+              <div style={{ padding: 40, textAlign: "center", color: "#9A9484", fontSize: 13.5 }}>Noch keine Dokumente abgelegt.</div>
+            ) : gefiltertesArchiv.map(e => (
+              <div key={e.id} style={{ display: "flex", gap: 12, padding: "14px 16px", borderBottom: "1px solid #F0EEE4", alignItems: "center" }}>
+                <img src={e.previewUrl} alt="" style={{ width: 44, height: 44, objectFit: "cover", borderRadius: 6, border: "1px solid #E4E1D6" }} />
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div className="mono" style={{ fontSize: 12.5, fontWeight: 500, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{e.dateiname}</div>
+                  <div style={{ fontSize: 11.5, color: "#9A9484", marginTop: 2 }}>{e.pfad}</div>
+                  {e.oneDriveStatus && (
+                    <div style={{ fontSize: 10.5, marginTop: 3, fontWeight: 600, color: e.oneDriveStatus === "ok" ? "#2E6F5E" : e.oneDriveStatus === "fehler" ? "#B23A34" : e.oneDriveStatus === "laedt_hoch" ? "#D98E3F" : "#9A9484" }}>
+                      {e.oneDriveStatus === "ok" && "✓ OneDrive"}
+                      {e.oneDriveStatus === "fehler" && "✗ Upload fehlgeschlagen"}
+                      {e.oneDriveStatus === "laedt_hoch" && "… lädt hoch"}
+                      {e.oneDriveStatus === "nicht_verbunden" && "nur lokal"}
+                    </div>
+                  )}
+                </div>
+                <span style={{ background: e.kategorie.farbe, color: "#fff", fontSize: 10, fontWeight: 600, padding: "3px 7px", borderRadius: 5, whiteSpace: "nowrap" }}>{e.kategorie.label}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<DokumentHub />);
+</script>
+</body>
+</html>
