@@ -392,6 +392,35 @@ function DokumentHub() {
 
   const verwerfen = () => { setSeiten([]); setErgebnis(null); setStatus("idle"); setFehler(null); setAnsicht("scan"); };
 
+  const verarbeiteUndLegeAnhaengeAb = useCallback(async (anhaengeListe) => {
+    let anzahlAbgelegt = 0;
+    for (const anhang of anhaengeListe) {
+      try {
+        const analyse = await analysiereBeleg(anhang.base64, anhang.mediaType);
+        const kat = KATEGORIEN.find(k => k.id === analyse.kategorie_id) || KATEGORIEN[8];
+        const pers = PERSONEN[0]; // Standard: Felix – manuell verschiebbar falls falsch
+        const jahr = (analyse.datum || heute()).slice(0,4);
+        const endung = /pdf/i.test(anhang.mediaType) ? "pdf" : "jpg";
+        const dateiname = eindeutigerDateiname(`${slugify(analyse.vorgeschlagener_dateiname)}.${endung}`);
+        const pfad = `DokumentHub/${pers.label}/${jahr}/${kat.label}/`;
+        const previewUrl = `data:${anhang.mediaType};base64,${anhang.base64}`;
+        const id = Date.now() + Math.random();
+        const eintrag = {
+          id, ...analyse, kategorie: kat, person: pers, dateiname, previewUrl,
+          seitenAnzahl: 1, pfad, abgelegtAm: new Date().toLocaleString("de-DE"),
+          oneDriveStatus: "laedt_hoch", ausEmail: true, emailBetreff: anhang.betreff, emailVon: anhang.von,
+        };
+        setArchiv(prev => [eintrag, ...prev]);
+        const blob = b64ToBlob(anhang.base64, anhang.mediaType);
+        await ladeHoch(eintrag, blob);
+        anzahlAbgelegt++;
+      } catch (e) {
+        // einzelner Anhang fehlgeschlagen -> überspringen, Rest weiterlaufen lassen
+      }
+    }
+    return anzahlAbgelegt;
+  }, []);
+
   const pruefeEmails = useCallback(async () => {
     if (!odToken || odStatus !== "verbunden") return;
     setMailStatus("prueft"); setMailFehler(null);
@@ -405,31 +434,7 @@ function DokumentHub() {
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "E-Mail-Prüfung fehlgeschlagen");
 
-      let anzahlAbgelegt = 0;
-      for (const anhang of data.anhaenge || []) {
-        try {
-          const analyse = await analysiereBeleg(anhang.base64, anhang.mediaType);
-          const kat = KATEGORIEN.find(k => k.id === analyse.kategorie_id) || KATEGORIEN[8];
-          const pers = PERSONEN[0]; // Standard: Felix – manuell verschiebbar falls falsch
-          const jahr = (analyse.datum || heute()).slice(0,4);
-          const endung = /pdf/i.test(anhang.mediaType) ? "pdf" : "jpg";
-          const dateiname = eindeutigerDateiname(`${slugify(analyse.vorgeschlagener_dateiname)}.${endung}`);
-          const pfad = `DokumentHub/${pers.label}/${jahr}/${kat.label}/`;
-          const previewUrl = `data:${anhang.mediaType};base64,${anhang.base64}`;
-          const id = Date.now() + Math.random();
-          const eintrag = {
-            id, ...analyse, kategorie: kat, person: pers, dateiname, previewUrl,
-            seitenAnzahl: 1, pfad, abgelegtAm: new Date().toLocaleString("de-DE"),
-            oneDriveStatus: "laedt_hoch", ausEmail: true, emailBetreff: anhang.betreff, emailVon: anhang.von,
-          };
-          setArchiv(prev => [eintrag, ...prev]);
-          const blob = b64ToBlob(anhang.base64, anhang.mediaType);
-          await ladeHoch(eintrag, blob);
-          anzahlAbgelegt++;
-        } catch (e) {
-          // einzelner Anhang fehlgeschlagen -> überspringen, Rest weiterlaufen lassen
-        }
-      }
+      const anzahlAbgelegt = await verarbeiteUndLegeAnhaengeAb(data.anhaenge || []);
 
       window.localStorage.setItem("dh_mail_letzte_pruefung", data.geprueftAm);
       setMailLetztePruefung(data.geprueftAm);
@@ -439,7 +444,55 @@ function DokumentHub() {
       setMailStatus("fehler");
       setMailFehler(e.message);
     }
-  }, [odToken, odStatus, archiv]);
+  }, [odToken, odStatus, verarbeiteUndLegeAnhaengeAb]);
+
+  const [importVon, setImportVon] = useState("2025-01-01");
+  const [importBis, setImportBis] = useState(() => heute());
+  const [importLaeuft, setImportLaeuft] = useState(false);
+  const [importFortschritt, setImportFortschritt] = useState(null);
+  const [importErgebnis, setImportErgebnis] = useState(null);
+
+  const starteZeitraumImport = async () => {
+    if (!odToken || odStatus !== "verbunden") return;
+    setImportLaeuft(true); setImportErgebnis(null);
+    const monate = [];
+    let cursor = new Date(importVon + "T00:00:00");
+    const ende = new Date(importBis + "T00:00:00");
+    while (cursor < ende) {
+      const von = new Date(cursor);
+      const bis = new Date(cursor.getFullYear(), cursor.getMonth() + 1, 1);
+      monate.push({ von, bis: bis < ende ? bis : ende });
+      cursor = bis;
+    }
+
+    let gesamtGefunden = 0, gesamtAbgelegt = 0;
+    for (let i = 0; i < monate.length; i++) {
+      const { von, bis } = monate[i];
+      const label = von.toLocaleDateString("de-DE", { month: "long", year: "numeric" });
+      setImportFortschritt(`${label} (${i + 1}/${monate.length}) wird durchsucht …`);
+      try {
+        const res = await fetch("/api/fetch-emails", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ von: von.toISOString(), bis: bis.toISOString() }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || "Fehler bei " + label);
+        gesamtGefunden += (data.anhaenge || []).length;
+        setImportFortschritt(`${label} (${i + 1}/${monate.length}): ${(data.anhaenge || []).length} Dokument(e) gefunden, wird abgelegt …`);
+        const abgelegt = await verarbeiteUndLegeAnhaengeAb(data.anhaenge || []);
+        gesamtAbgelegt += abgelegt;
+      } catch (e) {
+        setImportFortschritt(`${label}: Fehler – ${e.message} (überspringe, weiter mit nächstem Monat)`);
+      }
+    }
+
+    window.localStorage.setItem("dh_mail_letzte_pruefung", ende.toISOString());
+    setMailLetztePruefung(ende.toISOString());
+    setImportFortschritt(null);
+    setImportErgebnis(`Fertig: ${gesamtGefunden} Dokumente gefunden, ${gesamtAbgelegt} erfolgreich abgelegt.`);
+    setImportLaeuft(false);
+  };
 
   useEffect(() => {
     if (odStatus === "verbunden") pruefeEmails();
@@ -674,6 +727,27 @@ function DokumentHub() {
                 ✓ Verbunden als {odUser.displayName || odUser.userPrincipalName}
               </div>
               {odAblaufZeit && <div style={{ fontSize: 12, color: "#9A9484" }}>Anmeldung gültig bis {new Date(odAblaufZeit).toLocaleTimeString("de-DE")} Uhr</div>}
+
+              <div style={{ marginTop: 24, paddingTop: 20, borderTop: "1px solid #E4E1D6" }}>
+                <div style={{ fontFamily: "'Newsreader', serif", fontSize: 16, fontWeight: 700, marginBottom: 4 }}>E-Mail-Postfach durchsuchen</div>
+                <div style={{ fontSize: 12.5, color: "#7A7566", marginBottom: 14 }}>Einmaliger Import für einen Zeitraum – durchsucht Posteingang & Gesendet monatsweise und legt gefundene Dokumente unter "Felix" ab.</div>
+                <div style={{ display: "flex", gap: 10, marginBottom: 12 }}>
+                  <div style={{ flex: 1 }}><span className="field-label">Von</span><input type="date" className="field-input" value={importVon} onChange={e => setImportVon(e.target.value)} disabled={importLaeuft} /></div>
+                  <div style={{ flex: 1 }}><span className="field-label">Bis</span><input type="date" className="field-input" value={importBis} onChange={e => setImportBis(e.target.value)} disabled={importLaeuft} /></div>
+                </div>
+                <button className="btn-secondary" disabled={importLaeuft} onClick={starteZeitraumImport}>
+                  {importLaeuft ? "Import läuft …" : "Import starten"}
+                </button>
+                {importFortschritt && (
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 12, fontSize: 12.5, color: "#7A7566" }}>
+                    <Spinner />
+                    <span>{importFortschritt}</span>
+                  </div>
+                )}
+                {importErgebnis && (
+                  <div style={{ background: "#EAF2EE", color: "#2E6F5E", padding: 10, borderRadius: 8, fontSize: 12.5, marginTop: 12 }}>{importErgebnis}</div>
+                )}
+              </div>
             </div>
           ) : (
             <div>
