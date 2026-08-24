@@ -265,6 +265,11 @@ function DokumentHub() {
   const [odFehler, setOdFehler] = useState(null);
   const [jetzt, setJetzt] = useState(Date.now());
 
+  const [mailStatus, setMailStatus] = useState("idle"); // idle | prueft | ok | fehler
+  const [mailFehler, setMailFehler] = useState(null);
+  const [mailLetztePruefung, setMailLetztePruefung] = useState(() => window.localStorage.getItem("dh_mail_letzte_pruefung") || null);
+  const [mailGefundeneAnzahl, setMailGefundeneAnzahl] = useState(0);
+
   useEffect(() => {
     const gefunden = leseTokenAusUrl();
     if (gefunden) {
@@ -387,6 +392,59 @@ function DokumentHub() {
 
   const verwerfen = () => { setSeiten([]); setErgebnis(null); setStatus("idle"); setFehler(null); setAnsicht("scan"); };
 
+  const pruefeEmails = useCallback(async () => {
+    if (!odToken || odStatus !== "verbunden") return;
+    setMailStatus("prueft"); setMailFehler(null);
+    try {
+      const seitDatum = window.localStorage.getItem("dh_mail_letzte_pruefung") || null;
+      const res = await fetch("/api/fetch-emails", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ seitDatum }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "E-Mail-Prüfung fehlgeschlagen");
+
+      let anzahlAbgelegt = 0;
+      for (const anhang of data.anhaenge || []) {
+        try {
+          const analyse = await analysiereBeleg(anhang.base64, anhang.mediaType);
+          const kat = KATEGORIEN.find(k => k.id === analyse.kategorie_id) || KATEGORIEN[8];
+          const pers = PERSONEN[0]; // Standard: Felix – manuell verschiebbar falls falsch
+          const jahr = (analyse.datum || heute()).slice(0,4);
+          const endung = /pdf/i.test(anhang.mediaType) ? "pdf" : "jpg";
+          const dateiname = eindeutigerDateiname(`${slugify(analyse.vorgeschlagener_dateiname)}.${endung}`);
+          const pfad = `DokumentHub/${pers.label}/${jahr}/${kat.label}/`;
+          const previewUrl = `data:${anhang.mediaType};base64,${anhang.base64}`;
+          const id = Date.now() + Math.random();
+          const eintrag = {
+            id, ...analyse, kategorie: kat, person: pers, dateiname, previewUrl,
+            seitenAnzahl: 1, pfad, abgelegtAm: new Date().toLocaleString("de-DE"),
+            oneDriveStatus: "laedt_hoch", ausEmail: true, emailBetreff: anhang.betreff, emailVon: anhang.von,
+          };
+          setArchiv(prev => [eintrag, ...prev]);
+          const blob = b64ToBlob(anhang.base64, anhang.mediaType);
+          await ladeHoch(eintrag, blob);
+          anzahlAbgelegt++;
+        } catch (e) {
+          // einzelner Anhang fehlgeschlagen -> überspringen, Rest weiterlaufen lassen
+        }
+      }
+
+      window.localStorage.setItem("dh_mail_letzte_pruefung", data.geprueftAm);
+      setMailLetztePruefung(data.geprueftAm);
+      setMailGefundeneAnzahl(anzahlAbgelegt);
+      setMailStatus("ok");
+    } catch (e) {
+      setMailStatus("fehler");
+      setMailFehler(e.message);
+    }
+  }, [odToken, odStatus, archiv]);
+
+  useEffect(() => {
+    if (odStatus === "verbunden") pruefeEmails();
+  }, [odStatus]);
+
   const [oneDriveTreffer, setOneDriveTreffer] = useState(null);
   const [oneDriveSucheLaeuft, setOneDriveSucheLaeuft] = useState(false);
   const sucheInOneDrive = async () => {
@@ -442,6 +500,22 @@ function DokumentHub() {
       {(tokenLaeuftBaldAb || tokenAbgelaufen) && odStatus === "verbunden" && (
         <div onClick={() => setAnsicht("onedrive")} style={{ background: "#FCEFDD", color: "#8A5A1F", padding: "10px 20px", fontSize: 12.5, cursor: "pointer", textAlign: "center" }}>
           {tokenAbgelaufen ? "Microsoft-Anmeldung abgelaufen – hier antippen, um dich neu anzumelden" : "Anmeldung läuft gleich ab – bald neu einloggen"}
+        </div>
+      )}
+
+      {odStatus === "verbunden" && mailStatus !== "idle" && (
+        <div style={{
+          background: mailStatus === "fehler" ? "#FBEAE8" : mailStatus === "prueft" ? "#EAF0FA" : "#EAF2EE",
+          color: mailStatus === "fehler" ? "#B23A34" : mailStatus === "prueft" ? "#2E4F7A" : "#2E6F5E",
+          padding: "8px 20px", fontSize: 12, textAlign: "center",
+        }}>
+          {mailStatus === "prueft" && "✉ E-Mails werden geprüft …"}
+          {mailStatus === "ok" && `✓ E-Mails geprüft${mailLetztePruefung ? " · " + new Date(mailLetztePruefung).toLocaleTimeString("de-DE", {hour:"2-digit", minute:"2-digit"}) + " Uhr" : ""}${mailGefundeneAnzahl > 0 ? ` · ${mailGefundeneAnzahl} neu abgelegt` : ""}`}
+          {mailStatus === "fehler" && (
+            <span onClick={pruefeEmails} style={{ cursor: "pointer" }}>
+              ⚠ E-Mail-Prüfung fehlgeschlagen{mailFehler ? `: ${mailFehler}` : ""} · antippen für erneuten Versuch
+            </span>
+          )}
         </div>
       )}
 
@@ -697,6 +771,7 @@ function DokumentHub() {
                       {e.konfidenz != null && e.konfidenz < 0.6 && <Badge color="#8A5A1F" bg="#FCEFDD">⚠ prüfen</Badge>}
                       {e.seitenAnzahl > 1 && <Badge color="#7A7566" bg="#EDEAE1">📄 {e.seitenAnzahl} Seiten</Badge>}
                       {e.person && e.person.id !== "felix" && <Badge color="#3E5C76" bg="#EAF0FA">{e.person.label}</Badge>}
+                      {e.ausEmail && <Badge color="#6B4226" bg="#F5EDE3">✉ aus E-Mail</Badge>}
                     </div>
                   </div>
                   <span style={{ background: e.kategorie.farbe, color: "#fff", fontSize: 10, fontWeight: 600, padding: "3px 7px", borderRadius: 5, whiteSpace: "nowrap", flexShrink: 0 }}>{e.kategorie.label}</span>
