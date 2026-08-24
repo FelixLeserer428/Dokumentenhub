@@ -45,6 +45,12 @@ const KATEGORIEN = [
   { id: "sonstiges", label: "Sonstiges", farbe: "#7A7A7A" },
 ];
 
+const PERSONEN = [
+  { id: "felix", label: "Felix" },
+  { id: "kilian", label: "Kilian" },
+  { id: "hedwig", label: "Hedwig" },
+];
+
 const heute = () => {
   const d = new Date();
   return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`;
@@ -121,6 +127,15 @@ async function analysiereBeleg(base64Image, mediaType) {
   return data;
 }
 
+async function grapheWeiteSuche(token, query) {
+  const res = await fetch(`https://graph.microsoft.com/v1.0/me/drive/root/search(q='${encodeURIComponent(query)}')?$select=name,webUrl,parentReference,lastModifiedDateTime,size`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) throw new Error(`OneDrive-Suche fehlgeschlagen (${res.status})`);
+  const data = await res.json();
+  return (data.value || []).filter(item => (item.parentReference?.path || "").includes("/DokumentHub"));
+}
+
 async function graphGet(token, path) {
   const res = await fetch(`https://graph.microsoft.com/v1.0${path}`, { headers: { Authorization: `Bearer ${token}` } });
   if (!res.ok) throw new Error(`Graph GET ${path} fehlgeschlagen (${res.status})`);
@@ -138,10 +153,11 @@ async function graphErstelleOrdnerFallsNoetig(token, parentPfad, ordnerName) {
   throw new Error(`Ordner '${ordnerName}' konnte nicht angelegt werden (${res.status})`);
 }
 
-async function stelleOrdnerpfadSicher(token, jahr, kategorieLabel) {
+async function stelleOrdnerpfadSicher(token, person, jahr, kategorieLabel) {
   await graphErstelleOrdnerFallsNoetig(token, "", "DokumentHub");
-  await graphErstelleOrdnerFallsNoetig(token, "DokumentHub", jahr);
-  await graphErstelleOrdnerFallsNoetig(token, `DokumentHub/${jahr}`, kategorieLabel);
+  await graphErstelleOrdnerFallsNoetig(token, "DokumentHub", person);
+  await graphErstelleOrdnerFallsNoetig(token, `DokumentHub/${person}`, jahr);
+  await graphErstelleOrdnerFallsNoetig(token, `DokumentHub/${person}/${jahr}`, kategorieLabel);
 }
 
 async function uploadZuOneDrive(token, pfad, dateiname, blob) {
@@ -232,9 +248,12 @@ function DokumentHub() {
   const [fehler, setFehler] = useState(null);
   const [seiten, setSeiten] = useState([]); // [{base64, mediaType, previewUrl}]
   const [ergebnis, setErgebnis] = useState(null);
+  const [person, setPerson] = useState("felix");
   const [weitereFelderOffen, setWeitereFelderOffen] = useState(false);
   const [archiv, setArchiv] = useState(() => ladeArchivAusSpeicher());
   const [filterKat, setFilterKat] = useState(null);
+  const [filterPerson, setFilterPerson] = useState(null);
+  const [suchbegriff, setSuchbegriff] = useState("");
   const fileInputRef = useRef(null);
   const weitereSeiteRef = useRef(null);
 
@@ -318,8 +337,9 @@ function DokumentHub() {
   const ladeHoch = async (eintrag, blob) => {
     try {
       const kat = eintrag.kategorie;
+      const pers = eintrag.person || PERSONEN[0];
       const jahr = (eintrag.datum || heute()).slice(0,4);
-      await stelleOrdnerpfadSicher(odToken, jahr, kat.label);
+      await stelleOrdnerpfadSicher(odToken, pers.label, jahr, kat.label);
       await uploadZuOneDrive(odToken, eintrag.pfad, eintrag.dateiname, blob);
       setArchiv(prev => prev.map(e => e.id === eintrag.id ? { ...e, oneDriveStatus: "ok" } : e));
     } catch (e) {
@@ -330,6 +350,7 @@ function DokumentHub() {
   const jetztAblegen = async () => {
     if (!ergebnis || seiten.length === 0) return;
     const kat = KATEGORIEN.find(k => k.id === ergebnis.kategorie_id) || KATEGORIEN[8];
+    const pers = PERSONEN.find(p => p.id === person) || PERSONEN[0];
     const jahr = (ergebnis.datum || heute()).slice(0,4);
 
     let blob, endung;
@@ -342,9 +363,9 @@ function DokumentHub() {
     }
 
     const dateiname = eindeutigerDateiname(`${slugify(ergebnis.vorgeschlagener_dateiname)}.${endung}`);
-    const pfad = `DokumentHub/${jahr}/${kat.label}/`;
+    const pfad = `DokumentHub/${pers.label}/${jahr}/${kat.label}/`;
     const id = Date.now();
-    const eintrag = { id, ...ergebnis, kategorie: kat, dateiname, previewUrl: seiten[0].previewUrl, seitenDaten: seiten, seitenAnzahl: seiten.length, pfad, abgelegtAm: new Date().toLocaleString("de-DE"), oneDriveStatus: odStatus === "verbunden" ? "laedt_hoch" : "nicht_verbunden" };
+    const eintrag = { id, ...ergebnis, kategorie: kat, person: pers, dateiname, previewUrl: seiten[0].previewUrl, seitenDaten: seiten, seitenAnzahl: seiten.length, pfad, abgelegtAm: new Date().toLocaleString("de-DE"), oneDriveStatus: odStatus === "verbunden" ? "laedt_hoch" : "nicht_verbunden" };
     setArchiv(prev => [eintrag, ...prev]);
     setSeiten([]); setErgebnis(null); setStatus("idle"); setAnsicht("archiv");
     if (odStatus === "verbunden" && odToken) await ladeHoch(eintrag, blob);
@@ -366,7 +387,30 @@ function DokumentHub() {
 
   const verwerfen = () => { setSeiten([]); setErgebnis(null); setStatus("idle"); setFehler(null); setAnsicht("scan"); };
 
-  const gefiltertesArchiv = filterKat ? archiv.filter(e => e.kategorie.id === filterKat) : archiv;
+  const [oneDriveTreffer, setOneDriveTreffer] = useState(null);
+  const [oneDriveSucheLaeuft, setOneDriveSucheLaeuft] = useState(false);
+  const sucheInOneDrive = async () => {
+    if (!suchbegriff.trim() || odStatus !== "verbunden" || !odToken) return;
+    setOneDriveSucheLaeuft(true);
+    try {
+      const treffer = await grapheWeiteSuche(odToken, suchbegriff.trim());
+      setOneDriveTreffer(treffer);
+    } catch (e) {
+      setOneDriveTreffer([]);
+    }
+    setOneDriveSucheLaeuft(false);
+  };
+
+  const gefiltertesArchiv = useMemo(() => {
+    let liste = filterKat ? archiv.filter(e => e.kategorie.id === filterKat) : archiv;
+    if (filterPerson) liste = liste.filter(e => (e.person?.id || "felix") === filterPerson);
+    const q = suchbegriff.trim().toLowerCase();
+    if (!q) return liste;
+    return liste.filter(e => [
+      e.dateiname, e.absender, e.dokumenttyp, e.betrag, e.betrag_netto, e.betrag_mwst,
+      e.iban, e.referenznummer, e.zusammenfassung,
+    ].filter(Boolean).some(feld => String(feld).toLowerCase().includes(q)));
+  }, [archiv, filterKat, filterPerson, suchbegriff]);
 
   return (
     <div style={{ fontFamily: "'IBM Plex Sans', sans-serif", background: "#F4F3EF", minHeight: "100vh", maxWidth: 480, margin: "0 auto", color: "#22201B" }}>
@@ -464,6 +508,18 @@ function DokumentHub() {
               )}
 
               <div style={{ marginBottom: 14 }}>
+                <span className="field-label">Für wen?</span>
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 6 }}>
+                  {PERSONEN.map(p => (
+                    <button key={p.id} onClick={() => setPerson(p.id)} style={{
+                      background: person === p.id ? "#16233D" : "#EDEAE1", color: person === p.id ? "#fff" : "#3A362E",
+                      border: "none", borderRadius: 6, padding: "6px 12px", fontSize: 12, fontWeight: 600, cursor: "pointer",
+                    }}>{p.label}</button>
+                  ))}
+                </div>
+              </div>
+
+              <div style={{ marginBottom: 14 }}>
                 <span className="field-label">Kategorie</span>
                 <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 6 }}>
                   {KATEGORIEN.map(k => (
@@ -528,7 +584,7 @@ function DokumentHub() {
                 <button className="btn-primary" onClick={jetztAblegen}>In Archiv ablegen</button>
               </div>
               <div style={{ fontSize: 11.5, color: "#9A9484", marginTop: 10, textAlign: "center" }}>
-                Wird als PDF abgelegt: OneDrive/DokumentHub/{(ergebnis.datum || heute()).slice(0,4)}/{(KATEGORIEN.find(k=>k.id===ergebnis.kategorie_id)||KATEGORIEN[8]).label}/
+                Wird als PDF abgelegt: OneDrive/DokumentHub/{(PERSONEN.find(p=>p.id===person)||PERSONEN[0]).label}/{(ergebnis.datum || heute()).slice(0,4)}/{(KATEGORIEN.find(k=>k.id===ergebnis.kategorie_id)||KATEGORIEN[8]).label}/
               </div>
             </div>
           )}
@@ -558,6 +614,50 @@ function DokumentHub() {
 
       {ansicht === "archiv" && (
         <div>
+          <div style={{ padding: "16px 16px 0", display: "flex", gap: 8 }}>
+            <input
+              className="field-input"
+              value={suchbegriff}
+              onChange={e => { setSuchbegriff(e.target.value); setOneDriveTreffer(null); }}
+              placeholder="Suchen: Absender, Betrag, IBAN, Referenznr. …"
+              style={{ marginBottom: 4 }}
+            />
+            {odStatus === "verbunden" && (
+              <button className="btn-small" style={{ flexShrink: 0 }} disabled={!suchbegriff.trim() || oneDriveSucheLaeuft} onClick={sucheInOneDrive}>
+                {oneDriveSucheLaeuft ? "…" : "Alle Geräte"}
+              </button>
+            )}
+          </div>
+
+          <div style={{ display: "flex", gap: 6, padding: "10px 16px 0" }}>
+            <button onClick={() => setFilterPerson(null)} style={{
+              background: !filterPerson ? "#16233D" : "#EDEAE1", color: !filterPerson ? "#fff" : "#3A362E",
+              border: "none", borderRadius: 20, padding: "5px 12px", fontSize: 12, fontWeight: 600, cursor: "pointer",
+            }}>Alle Personen</button>
+            {PERSONEN.map(p => (
+              <button key={p.id} onClick={() => setFilterPerson(p.id)} style={{
+                background: filterPerson === p.id ? "#16233D" : "#EDEAE1", color: filterPerson === p.id ? "#fff" : "#3A362E",
+                border: "none", borderRadius: 20, padding: "5px 12px", fontSize: 12, fontWeight: 600, cursor: "pointer",
+              }}>{p.label}</button>
+            ))}
+          </div>
+
+          {oneDriveTreffer && (
+            <div style={{ margin: "12px 16px 0", background: "#fff", border: "1px solid #E4E1D6", borderRadius: 10, overflow: "hidden" }}>
+              <div style={{ padding: "8px 14px", fontSize: 11, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.06em", color: "#7A7566", background: "#FBFAF7" }}>
+                In OneDrive gefunden ({oneDriveTreffer.length})
+              </div>
+              {oneDriveTreffer.length === 0 ? (
+                <div style={{ padding: 16, fontSize: 13, color: "#9A9484" }}>Keine Treffer in deinem OneDrive-DokumentHub.</div>
+              ) : oneDriveTreffer.map(item => (
+                <a key={item.id || item.webUrl} href={item.webUrl} target="_blank" rel="noopener noreferrer" style={{ display: "block", padding: "10px 14px", borderTop: "1px solid #F0EEE4", textDecoration: "none", color: "#22201B" }}>
+                  <div className="mono" style={{ fontSize: 12.5 }}>{item.name}</div>
+                  <div style={{ fontSize: 11, color: "#9A9484", marginTop: 2 }}>{item.parentReference?.path?.replace(/^.*root:/, "") || ""}</div>
+                </a>
+              ))}
+            </div>
+          )}
+
           <div style={{ display: "flex", gap: 4, overflowX: "auto", padding: "12px 16px 0" }}>
             <FolderTab kategorie={{ farbe: "#16233D", label: "Alle" }} active={!filterKat} onClick={() => setFilterKat(null)} count={archiv.length} />
             {KATEGORIEN.map(k => {
@@ -568,7 +668,9 @@ function DokumentHub() {
           </div>
           <div style={{ background: "#fff", margin: "0 16px 16px", borderRadius: "0 12px 12px 12px", border: "1px solid #E4E1D6", overflow: "hidden" }}>
             {gefiltertesArchiv.length === 0 ? (
-              <div style={{ padding: 40, textAlign: "center", color: "#9A9484", fontSize: 13.5 }}>Noch keine Dokumente abgelegt.</div>
+              <div style={{ padding: 40, textAlign: "center", color: "#9A9484", fontSize: 13.5 }}>
+                {suchbegriff.trim() ? `Keine Treffer für "${suchbegriff}".` : "Noch keine Dokumente abgelegt."}
+              </div>
             ) : gefiltertesArchiv.map(e => {
               const tage = tageBisFaelligkeit(e.faelligkeitsdatum);
               return (
@@ -590,6 +692,7 @@ function DokumentHub() {
                       {tage != null && tage <= 14 && <Badge color={tage < 0 ? "#B23A34" : "#8A5A1F"} bg={tage < 0 ? "#FBEAE8" : "#FCEFDD"}>{tage < 0 ? `überfällig seit ${Math.abs(tage)}T` : tage === 0 ? "heute fällig" : `fällig in ${tage}T`}</Badge>}
                       {e.konfidenz != null && e.konfidenz < 0.6 && <Badge color="#8A5A1F" bg="#FCEFDD">⚠ prüfen</Badge>}
                       {e.seitenAnzahl > 1 && <Badge color="#7A7566" bg="#EDEAE1">📄 {e.seitenAnzahl} Seiten</Badge>}
+                      {e.person && e.person.id !== "felix" && <Badge color="#3E5C76" bg="#EAF0FA">{e.person.label}</Badge>}
                     </div>
                   </div>
                   <span style={{ background: e.kategorie.farbe, color: "#fff", fontSize: 10, fontWeight: 600, padding: "3px 7px", borderRadius: 5, whiteSpace: "nowrap", flexShrink: 0 }}>{e.kategorie.label}</span>
