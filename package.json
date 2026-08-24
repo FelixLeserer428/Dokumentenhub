@@ -2,5 +2,9 @@
   "name": "dokumenthub",
   "version": "1.0.0",
   "private": true,
-  "description": "Persönliches Dokumentenablage-System mit KI-Erkennung und OneDrive-Anbindung"
+  "description": "Persönliches Dokumentenablage-System mit KI-Erkennung und OneDrive-Anbindung",
+  "dependencies": {
+    "imapflow": "^1.0.171",
+    "mailparser": "^3.7.1"
+  }
 }
