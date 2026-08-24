@@ -426,7 +426,7 @@ function DokumentHub() {
         .checkbox-row { display:flex; align-items:center; gap:8px; font-size:13.5px; color:#3A362E; }
       `}</style>
 
-      <div style={{ padding: "22px 20px 16px", borderBottom: "1px solid #E4E1D6" }}>
+      <div style={{ padding: "calc(22px + env(safe-area-inset-top, 0px)) 20px 16px", borderBottom: "1px solid #E4E1D6" }}>
         <div style={{ fontFamily: "'Newsreader', serif", fontSize: 26, fontWeight: 700 }}>DokumentHub</div>
         <div style={{ fontSize: 13, color: "#7A7566", marginTop: 2 }}>Scan · Erkennung · Ablage</div>
         <div style={{ display: "flex", gap: 8, marginTop: 16, flexWrap: "wrap" }}>
@@ -682,7 +682,11 @@ function DokumentHub() {
                     <div style={{ display: "flex", flexWrap: "wrap", gap: 5, marginTop: 5 }}>
                       {e.oneDriveStatus === "ok" && <Badge color="#2E6F5E" bg="#EAF2EE">✓ OneDrive</Badge>}
                       {e.oneDriveStatus === "laedt_hoch" && <Badge color="#8A5A1F" bg="#FCEFDD">… lädt hoch</Badge>}
-                      {e.oneDriveStatus === "nicht_verbunden" && <Badge color="#7A7566" bg="#EDEAE1">nur lokal</Badge>}
+                      {e.oneDriveStatus === "nicht_verbunden" && (
+                        <span onClick={() => odStatus === "verbunden" ? erneutHochladen(e) : setAnsicht("onedrive")} style={{ cursor: "pointer" }}>
+                          <Badge color="#7A7566" bg="#EDEAE1">{odStatus === "verbunden" ? "nur lokal · jetzt hochladen" : "nur lokal"}</Badge>
+                        </span>
+                      )}
                       {e.oneDriveStatus === "fehler" && (
                         <span onClick={() => erneutHochladen(e)} style={{ cursor: "pointer" }}>
                           <Badge color="#B23A34" bg="#FBEAE8">✗ fehlgeschlagen · erneut versuchen</Badge>
