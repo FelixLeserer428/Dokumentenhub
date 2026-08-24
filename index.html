@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
 <title>DokumentHub</title>
 
-<!-- iPhone: als Vollbild-App vom Homescreen startbar -->
+<meta name="mobile-web-app-capable" content="yes" />
 <meta name="apple-mobile-web-app-capable" content="yes" />
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
 <meta name="apple-mobile-web-app-title" content="DokumentHub" />
@@ -14,21 +14,23 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,500;0,6..72,700;1,6..72,500&family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
 
-<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
-<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
-<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script crossorigin src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone@7.24.7/babel.min.js"></script>
 
 <style>
   html, body { margin: 0; padding: 0; background: #F4F3EF; }
   * { box-sizing: border-box; }
   #root { min-height: 100vh; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.5; } }
 </style>
 </head>
 <body>
 <div id="root"></div>
 
 <script type="text/babel" data-presets="react">
-const { useState, useEffect, useRef, useCallback } = React;
+const { useState, useEffect, useRef, useCallback, useMemo } = React;
 
 const KATEGORIEN = [
   { id: "vermietung", label: "Vermietung", farbe: "#4B6455" },
@@ -56,6 +58,33 @@ function slugify(text) {
     .slice(0, 60);
 }
 
+// Bild client-seitig verkleinern & immer als JPEG ausgeben (spart Kosten + löst HEIC-Problem)
+function komprimiereBild(file, maxDim = 1600, qualitaet = 0.82) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error("Datei konnte nicht gelesen werden"));
+    reader.onload = () => {
+      const img = new Image();
+      img.onerror = () => reject(new Error("Bild konnte nicht verarbeitet werden (Format nicht unterstützt)"));
+      img.onload = () => {
+        let { width, height } = img;
+        if (width > maxDim || height > maxDim) {
+          if (width > height) { height = Math.round(height * (maxDim / width)); width = maxDim; }
+          else { width = Math.round(width * (maxDim / height)); height = maxDim; }
+        }
+        const canvas = document.createElement("canvas");
+        canvas.width = width; canvas.height = height;
+        const ctx = canvas.getContext("2d");
+        ctx.drawImage(img, 0, 0, width, height);
+        const dataUrl = canvas.toDataURL("image/jpeg", qualitaet);
+        resolve({ base64: dataUrl.split(",")[1], mediaType: "image/jpeg", previewUrl: dataUrl });
+      };
+      img.src = reader.result;
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
 function b64ToBlob(base64, mediaType) {
   const byteChars = atob(base64);
   const byteNumbers = new Array(byteChars.length);
@@ -69,17 +98,34 @@ async function analysiereBeleg(base64Image, mediaType) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ base64Image, mediaType }),
   });
-  const data = await res.json();
+  let data;
+  try { data = await res.json(); }
+  catch { throw new Error("Server hat keine gültige Antwort geliefert (Status " + res.status + ")"); }
   if (!res.ok) throw new Error(data.error || "Analyse fehlgeschlagen");
   return data;
 }
 
 async function graphGet(token, path) {
-  const res = await fetch(`https://graph.microsoft.com/v1.0${path}`, {
-    headers: { Authorization: `Bearer ${token}` },
-  });
+  const res = await fetch(`https://graph.microsoft.com/v1.0${path}`, { headers: { Authorization: `Bearer ${token}` } });
   if (!res.ok) throw new Error(`Graph GET ${path} fehlgeschlagen (${res.status})`);
   return res.json();
+}
+
+async function graphErstelleOrdnerFallsNoetig(token, parentPfad, ordnerName) {
+  const basis = parentPfad ? `https://graph.microsoft.com/v1.0/me/drive/root:/${parentPfad.split("/").map(encodeURIComponent).join("/")}:/children` : `https://graph.microsoft.com/v1.0/me/drive/root/children`;
+  const res = await fetch(basis, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ name: ordnerName, folder: {}, "@microsoft.graph.conflictBehavior": "fail" }),
+  });
+  if (res.ok || res.status === 409) return true; // 409 = existiert schon, gewollt
+  throw new Error(`Ordner '${ordnerName}' konnte nicht angelegt werden (${res.status})`);
+}
+
+async function stelleOrdnerpfadSicher(token, jahr, kategorieLabel) {
+  await graphErstelleOrdnerFallsNoetig(token, "", "DokumentHub");
+  await graphErstelleOrdnerFallsNoetig(token, "DokumentHub", jahr);
+  await graphErstelleOrdnerFallsNoetig(token, `DokumentHub/${jahr}`, kategorieLabel);
 }
 
 async function uploadZuOneDrive(token, pfad, dateiname, blob) {
@@ -116,18 +162,37 @@ function leseTokenAusUrl() {
   if (!window.location.hash) return null;
   const params = new URLSearchParams(window.location.hash.substring(1));
   const token = params.get("access_token");
+  const expiresIn = params.get("expires_in");
   if (token) {
     window.history.replaceState(null, "", window.location.pathname);
-    return token;
+    return { token, ablaufZeit: Date.now() + (parseInt(expiresIn || "3600", 10) * 1000) };
   }
   return null;
+}
+
+function ladeArchivAusSpeicher() {
+  try {
+    const raw = window.localStorage.getItem("dh_archiv");
+    return raw ? JSON.parse(raw) : [];
+  } catch { return []; }
+}
+
+function speichereArchiv(archiv) {
+  try { window.localStorage.setItem("dh_archiv", JSON.stringify(archiv)); } catch (e) { /* Speicher evtl. voll, ignorieren */ }
+}
+
+function Spinner() {
+  return <div style={{ width: 22, height: 22, border: "2.5px solid #DCD8CC", borderTopColor: "#16233D", borderRadius: "50%", animation: "spin 0.7s linear infinite", margin: "0 auto" }} />;
+}
+
+function Badge({ children, color, bg }) {
+  return <span style={{ background: bg, color, fontSize: 10.5, fontWeight: 700, padding: "3px 8px", borderRadius: 20, whiteSpace: "nowrap" }}>{children}</span>;
 }
 
 function FolderTab({ kategorie, active, onClick, count }) {
   return (
     <button onClick={onClick} style={{
-      background: active ? kategorie.farbe : "#EDEAE1",
-      color: active ? "#fff" : "#3A362E",
+      background: active ? kategorie.farbe : "#EDEAE1", color: active ? "#fff" : "#3A362E",
       border: "none", borderRadius: "8px 8px 0 0", padding: "8px 14px",
       fontFamily: "'IBM Plex Sans', sans-serif", fontSize: 12.5, fontWeight: 600,
       cursor: "pointer", whiteSpace: "nowrap", position: "relative", top: active ? 0 : 3,
@@ -138,33 +203,48 @@ function FolderTab({ kategorie, active, onClick, count }) {
   );
 }
 
+function tageBisFaelligkeit(datum) {
+  if (!datum) return null;
+  const heute0 = new Date(); heute0.setHours(0,0,0,0);
+  const ziel = new Date(datum); ziel.setHours(0,0,0,0);
+  return Math.round((ziel - heute0) / 86400000);
+}
+
 function DokumentHub() {
   const [ansicht, setAnsicht] = useState("scan");
   const [status, setStatus] = useState("idle");
   const [fehler, setFehler] = useState(null);
   const [bildDaten, setBildDaten] = useState(null);
   const [ergebnis, setErgebnis] = useState(null);
-  const [archiv, setArchiv] = useState([]);
+  const [weitereFelderOffen, setWeitereFelderOffen] = useState(false);
+  const [archiv, setArchiv] = useState(() => ladeArchivAusSpeicher());
   const [filterKat, setFilterKat] = useState(null);
   const fileInputRef = useRef(null);
 
   const [clientId, setClientId] = useState(() => window.localStorage.getItem("dh_client_id") || "");
   const [odToken, setOdToken] = useState(null);
+  const [odAblaufZeit, setOdAblaufZeit] = useState(null);
   const [odUser, setOdUser] = useState(null);
   const [odStatus, setOdStatus] = useState("idle");
   const [odFehler, setOdFehler] = useState(null);
+  const [jetzt, setJetzt] = useState(Date.now());
 
   useEffect(() => {
-    const token = leseTokenAusUrl();
-    if (token) {
-      setOdToken(token);
-      window.sessionStorage.setItem("dh_token", token);
+    const gefunden = leseTokenAusUrl();
+    if (gefunden) {
+      setOdToken(gefunden.token); setOdAblaufZeit(gefunden.ablaufZeit);
+      window.sessionStorage.setItem("dh_token", gefunden.token);
+      window.sessionStorage.setItem("dh_token_ablauf", String(gefunden.ablaufZeit));
       setAnsicht("onedrive");
     } else {
-      const gespeichert = window.sessionStorage.getItem("dh_token");
-      if (gespeichert) setOdToken(gespeichert);
+      const t = window.sessionStorage.getItem("dh_token");
+      const a = window.sessionStorage.getItem("dh_token_ablauf");
+      if (t && a && Date.now() < Number(a)) { setOdToken(t); setOdAblaufZeit(Number(a)); }
     }
   }, []);
+
+  useEffect(() => { speichereArchiv(archiv); }, [archiv]);
+  useEffect(() => { const iv = setInterval(() => setJetzt(Date.now()), 30000); return () => clearInterval(iv); }, []);
 
   useEffect(() => {
     if (!odToken) return;
@@ -174,48 +254,71 @@ function DokumentHub() {
       .catch(() => { setOdStatus("fehler"); setOdFehler("Anmeldung abgelaufen, bitte erneut einloggen."); setOdToken(null); window.sessionStorage.removeItem("dh_token"); });
   }, [odToken]);
 
+  const tokenLaeuftBaldAb = odAblaufZeit && (odAblaufZeit - jetzt) < 5 * 60 * 1000 && (odAblaufZeit - jetzt) > 0;
+  const tokenAbgelaufen = odAblaufZeit && jetzt >= odAblaufZeit;
+
   const handleDatei = useCallback((file) => {
     if (!file) return;
-    setFehler(null); setErgebnis(null);
-    const reader = new FileReader();
-    reader.onload = async () => {
-      const result = reader.result;
-      const base64 = result.split(",")[1];
-      const mediaType = file.type || "image/jpeg";
-      setBildDaten({ base64, mediaType, previewUrl: result });
-      setStatus("analysiere"); setAnsicht("pruefen");
-      try {
-        const analyse = await analysiereBeleg(base64, mediaType);
-        setErgebnis(analyse); setStatus("fertig");
-      } catch (e) {
-        setFehler("Analyse fehlgeschlagen: " + e.message);
-        setErgebnis({ kategorie_id: "sonstiges", dokumenttyp: "", absender: "", betrag: null, datum: heute(), zusammenfassung: "", vorgeschlagener_dateiname: `${heute()}_Dokument` });
-        setStatus("fertig");
-      }
-    };
-    reader.readAsDataURL(file);
+    setFehler(null); setErgebnis(null); setWeitereFelderOffen(false);
+    setStatus("komprimiere"); setAnsicht("pruefen");
+    komprimiereBild(file)
+      .then(async ({ base64, mediaType, previewUrl }) => {
+        setBildDaten({ base64, mediaType, previewUrl });
+        setStatus("analysiere");
+        try {
+          const analyse = await analysiereBeleg(base64, mediaType);
+          setErgebnis(analyse); setStatus("fertig");
+        } catch (e) {
+          setFehler("Analyse fehlgeschlagen: " + e.message);
+          setErgebnis({ kategorie_id: "sonstiges", dokumenttyp: "", absender: "", betrag: null, betrag_netto: null, betrag_mwst: null, datum: heute(), faelligkeitsdatum: null, ist_wiederkehrend: false, referenznummer: null, iban: null, zusammenfassung: "", konfidenz: null, mehrseiten_hinweis: null, vorgeschlagener_dateiname: `${heute()}_Dokument` });
+          setStatus("fertig");
+        }
+      })
+      .catch((e) => {
+        setFehler("Bild konnte nicht verarbeitet werden: " + e.message);
+        setStatus("idle"); setAnsicht("scan");
+      });
   }, []);
+
+  const eindeutigerDateiname = (basisname) => {
+    const vorhandene = new Set(archiv.map(e => e.dateiname));
+    let name = basisname, n = 2;
+    while (vorhandene.has(name)) { name = basisname.replace(/\.jpg$/, `-${n}.jpg`); n++; }
+    return name;
+  };
+
+  const ladeHoch = async (eintrag, bildBase64) => {
+    try {
+      const kat = eintrag.kategorie;
+      const jahr = (eintrag.datum || heute()).slice(0,4);
+      await stelleOrdnerpfadSicher(odToken, jahr, kat.label);
+      const blob = b64ToBlob(bildBase64, "image/jpeg");
+      await uploadZuOneDrive(odToken, eintrag.pfad, eintrag.dateiname, blob);
+      setArchiv(prev => prev.map(e => e.id === eintrag.id ? { ...e, oneDriveStatus: "ok" } : e));
+    } catch (e) {
+      setArchiv(prev => prev.map(x => x.id === eintrag.id ? { ...x, oneDriveStatus: "fehler", oneDriveFehler: e.message } : x));
+    }
+  };
 
   const jetztAblegen = async () => {
     if (!ergebnis) return;
     const kat = KATEGORIEN.find(k => k.id === ergebnis.kategorie_id) || KATEGORIEN[8];
-    const dateiname = slugify(ergebnis.vorgeschlagener_dateiname) + ".jpg";
-    const pfad = `DokumentHub/${(ergebnis.datum || heute()).slice(0,4)}/${kat.label}/`;
+    const jahr = (ergebnis.datum || heute()).slice(0,4);
+    const dateiname = eindeutigerDateiname(slugify(ergebnis.vorgeschlagener_dateiname) + ".jpg");
+    const pfad = `DokumentHub/${jahr}/${kat.label}/`;
     const id = Date.now();
     const eintrag = { id, ...ergebnis, kategorie: kat, dateiname, previewUrl: bildDaten.previewUrl, pfad, abgelegtAm: new Date().toLocaleString("de-DE"), oneDriveStatus: odStatus === "verbunden" ? "laedt_hoch" : "nicht_verbunden" };
     setArchiv(prev => [eintrag, ...prev]);
-    const bildLokal = bildDaten;
+    const base64Lokal = bildDaten.base64;
     setBildDaten(null); setErgebnis(null); setStatus("idle"); setAnsicht("archiv");
+    if (odStatus === "verbunden" && odToken) await ladeHoch(eintrag, base64Lokal);
+  };
 
-    if (odStatus === "verbunden" && odToken) {
-      try {
-        const blob = b64ToBlob(bildLokal.base64, bildLokal.mediaType);
-        await uploadZuOneDrive(odToken, pfad, dateiname, blob);
-        setArchiv(prev => prev.map(e => e.id === id ? { ...e, oneDriveStatus: "ok" } : e));
-      } catch (e) {
-        setArchiv(prev => prev.map(e => e.id === id ? { ...e, oneDriveStatus: "fehler" } : e));
-      }
-    }
+  const erneutHochladen = (eintrag) => {
+    if (odStatus !== "verbunden" || !odToken) { setAnsicht("onedrive"); return; }
+    setArchiv(prev => prev.map(e => e.id === eintrag.id ? { ...e, oneDriveStatus: "laedt_hoch" } : e));
+    const base64 = eintrag.previewUrl.split(",")[1];
+    ladeHoch(eintrag, base64);
   };
 
   const verwerfen = () => { setBildDaten(null); setErgebnis(null); setStatus("idle"); setFehler(null); setAnsicht("scan"); };
@@ -225,12 +328,15 @@ function DokumentHub() {
   return (
     <div style={{ fontFamily: "'IBM Plex Sans', sans-serif", background: "#F4F3EF", minHeight: "100vh", maxWidth: 480, margin: "0 auto", color: "#22201B" }}>
       <style>{`
-        .btn-primary { background:#16233D; color:#F4F3EF; border:none; border-radius:10px; padding:14px 20px; font-family:'IBM Plex Sans',sans-serif; font-weight:600; font-size:15px; cursor:pointer; width:100%; }
+        .btn-primary { background:#16233D; color:#F4F3EF; border:none; border-radius:10px; padding:14px 20px; font-family:'IBM Plex Sans',sans-serif; font-weight:600; font-size:15px; cursor:pointer; width:100%; transition:opacity .15s; }
         .btn-primary:disabled { opacity:0.5; }
+        .btn-primary:active:not(:disabled) { opacity:0.85; }
         .btn-secondary { background:transparent; color:#16233D; border:1.5px solid #16233D; border-radius:10px; padding:13px 20px; font-family:'IBM Plex Sans',sans-serif; font-weight:600; font-size:15px; cursor:pointer; width:100%; }
+        .btn-small { background:#16233D; color:#fff; border:none; border-radius:7px; padding:6px 12px; font-size:12px; font-weight:600; cursor:pointer; }
         .field-label { font-size:11px; text-transform:uppercase; letter-spacing:0.06em; color:#7A7566; font-weight:600; margin-bottom:4px; display:block; }
         .field-input { width:100%; padding:10px 12px; border:1.5px solid #DCD8CC; border-radius:8px; font-family:'IBM Plex Sans',sans-serif; font-size:14.5px; background:#fff; color:#22201B; }
         .mono { font-family:'IBM Plex Mono', monospace; }
+        .checkbox-row { display:flex; align-items:center; gap:8px; font-size:13.5px; color:#3A362E; }
       `}</style>
 
       <div style={{ padding: "22px 20px 16px", borderBottom: "1px solid #E4E1D6" }}>
@@ -246,12 +352,18 @@ function DokumentHub() {
         </div>
       </div>
 
+      {(tokenLaeuftBaldAb || tokenAbgelaufen) && odStatus === "verbunden" && (
+        <div onClick={() => setAnsicht("onedrive")} style={{ background: "#FCEFDD", color: "#8A5A1F", padding: "10px 20px", fontSize: 12.5, cursor: "pointer", textAlign: "center" }}>
+          {tokenAbgelaufen ? "Microsoft-Anmeldung abgelaufen – hier antippen, um dich neu anzumelden" : "Anmeldung läuft gleich ab – bald neu einloggen"}
+        </div>
+      )}
+
       {ansicht === "scan" && (
         <div style={{ padding: 20 }}>
           <div style={{ border: "2px dashed #C9C4B4", borderRadius: 16, padding: "48px 20px", textAlign: "center", background: "#FBFAF7" }}>
             <div style={{ fontSize: 40, marginBottom: 12 }}>📄</div>
             <div style={{ fontWeight: 600, marginBottom: 6, fontSize: 15 }}>Dokument fotografieren</div>
-            <div style={{ fontSize: 13, color: "#9A9484", marginBottom: 20 }}>JPG, PNG · Kamera oder Fotomediathek</div>
+            <div style={{ fontSize: 13, color: "#9A9484", marginBottom: 20 }}>JPG, PNG, HEIC · wird automatisch komprimiert</div>
             <input ref={fileInputRef} type="file" accept="image/*" capture="environment" style={{ display: "none" }} onChange={e => handleDatei(e.target.files[0])} />
             <button className="btn-primary" onClick={() => fileInputRef.current?.click()}>Kamera öffnen</button>
           </div>
@@ -261,10 +373,31 @@ function DokumentHub() {
       {ansicht === "pruefen" && (
         <div style={{ padding: 20 }}>
           {bildDaten && <img src={bildDaten.previewUrl} alt="Scan" style={{ width: "100%", borderRadius: 12, marginBottom: 16, border: "1px solid #E4E1D6" }} />}
-          {status === "analysiere" && <div style={{ textAlign: "center", padding: "30px 0", color: "#7A7566" }} className="mono">Analysiere Dokument …</div>}
+
+          {(status === "komprimiere" || status === "analysiere") && (
+            <div style={{ textAlign: "center", padding: "36px 0" }}>
+              <Spinner />
+              <div className="mono" style={{ fontSize: 12.5, color: "#7A7566", marginTop: 14, animation: "pulse 1.4s ease-in-out infinite" }}>
+                {status === "komprimiere" ? "Bild wird komprimiert …" : "Claude analysiert das Dokument …"}
+              </div>
+            </div>
+          )}
+
           {status === "fertig" && ergebnis && (
             <div>
               {fehler && <div style={{ background: "#FBEAE8", color: "#B23A34", padding: 10, borderRadius: 8, fontSize: 13, marginBottom: 14 }}>{fehler}</div>}
+
+              {ergebnis.konfidenz != null && ergebnis.konfidenz < 0.6 && (
+                <div style={{ background: "#FCEFDD", color: "#8A5A1F", padding: 10, borderRadius: 8, fontSize: 12.5, marginBottom: 14 }}>
+                  ⚠ Niedrige Erkennungssicherheit ({Math.round(ergebnis.konfidenz * 100)}%) – bitte Angaben genau prüfen.
+                </div>
+              )}
+              {ergebnis.mehrseiten_hinweis && (
+                <div style={{ background: "#EAF0FA", color: "#2E4F7A", padding: 10, borderRadius: 8, fontSize: 12.5, marginBottom: 14 }}>
+                  📄 {ergebnis.mehrseiten_hinweis} erkannt – ggf. fehlen weitere Seiten dieses Dokuments.
+                </div>
+              )}
+
               <div style={{ marginBottom: 14 }}>
                 <span className="field-label">Kategorie</span>
                 <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 6 }}>
@@ -276,21 +409,61 @@ function DokumentHub() {
                   ))}
                 </div>
               </div>
+
               <div style={{ marginBottom: 12 }}>
                 <span className="field-label">Dateiname (ohne Endung)</span>
                 <input className="field-input mono" value={ergebnis.vorgeschlagener_dateiname || ""} onChange={e => setErgebnis({ ...ergebnis, vorgeschlagener_dateiname: e.target.value })} />
               </div>
+
               <div style={{ display: "flex", gap: 10, marginBottom: 12 }}>
                 <div style={{ flex: 1 }}><span className="field-label">Dokumenttyp</span><input className="field-input" value={ergebnis.dokumenttyp || ""} onChange={e => setErgebnis({ ...ergebnis, dokumenttyp: e.target.value })} /></div>
                 <div style={{ flex: 1 }}><span className="field-label">Datum</span><input className="field-input" value={ergebnis.datum || ""} onChange={e => setErgebnis({ ...ergebnis, datum: e.target.value })} /></div>
               </div>
-              <div style={{ display: "flex", gap: 10, marginBottom: 18 }}>
+
+              <div style={{ display: "flex", gap: 10, marginBottom: 12 }}>
                 <div style={{ flex: 1 }}><span className="field-label">Absender</span><input className="field-input" value={ergebnis.absender || ""} onChange={e => setErgebnis({ ...ergebnis, absender: e.target.value })} /></div>
                 <div style={{ flex: 1 }}><span className="field-label">Betrag</span><input className="field-input" value={ergebnis.betrag || ""} onChange={e => setErgebnis({ ...ergebnis, betrag: e.target.value })} /></div>
               </div>
+
+              <div style={{ marginBottom: 12 }}>
+                <label className="checkbox-row">
+                  <input type="checkbox" checked={!!ergebnis.ist_wiederkehrend} onChange={e => setErgebnis({ ...ergebnis, ist_wiederkehrend: e.target.checked })} />
+                  🔁 Wiederkehrender Vorgang (Miete, Abo, Dauerauftrag …)
+                </label>
+              </div>
+
+              <button onClick={() => setWeitereFelderOffen(!weitereFelderOffen)} style={{ background: "none", border: "none", color: "#16233D", fontWeight: 600, fontSize: 12.5, cursor: "pointer", padding: "6px 0", marginBottom: 8 }}>
+                {weitereFelderOffen ? "− Weitere Details ausblenden" : "+ Weitere Details (Fälligkeit, Referenz, IBAN, MwSt.)"}
+              </button>
+
+              {weitereFelderOffen && (
+                <div style={{ background: "#FBFAF7", border: "1px solid #E4E1D6", borderRadius: 10, padding: 14, marginBottom: 14 }}>
+                  <div style={{ display: "flex", gap: 10, marginBottom: 10 }}>
+                    <div style={{ flex: 1 }}><span className="field-label">Fälligkeitsdatum</span><input className="field-input" value={ergebnis.faelligkeitsdatum || ""} onChange={e => setErgebnis({ ...ergebnis, faelligkeitsdatum: e.target.value })} placeholder="YYYY-MM-DD" /></div>
+                    <div style={{ flex: 1 }}><span className="field-label">Referenznummer</span><input className="field-input" value={ergebnis.referenznummer || ""} onChange={e => setErgebnis({ ...ergebnis, referenznummer: e.target.value })} /></div>
+                  </div>
+                  <div style={{ display: "flex", gap: 10, marginBottom: 10 }}>
+                    <div style={{ flex: 1 }}><span className="field-label">Netto</span><input className="field-input" value={ergebnis.betrag_netto || ""} onChange={e => setErgebnis({ ...ergebnis, betrag_netto: e.target.value })} /></div>
+                    <div style={{ flex: 1 }}><span className="field-label">MwSt.</span><input className="field-input" value={ergebnis.betrag_mwst || ""} onChange={e => setErgebnis({ ...ergebnis, betrag_mwst: e.target.value })} /></div>
+                  </div>
+                  <span className="field-label">IBAN</span>
+                  <input className="field-input mono" value={ergebnis.iban || ""} onChange={e => setErgebnis({ ...ergebnis, iban: e.target.value })} />
+                </div>
+              )}
+
+              {ergebnis.zusammenfassung && (
+                <div style={{ marginBottom: 18, fontSize: 13.5, color: "#4A4636", lineHeight: 1.5 }}>
+                  <span className="field-label">Kurzbeschreibung</span>
+                  {ergebnis.zusammenfassung}
+                </div>
+              )}
+
               <div style={{ display: "flex", gap: 10 }}>
                 <button className="btn-secondary" onClick={verwerfen}>Verwerfen</button>
                 <button className="btn-primary" onClick={jetztAblegen}>In Archiv ablegen</button>
+              </div>
+              <div style={{ fontSize: 11.5, color: "#9A9484", marginTop: 10, textAlign: "center" }}>
+                Wird abgelegt: OneDrive/DokumentHub/{(ergebnis.datum || heute()).slice(0,4)}/{(KATEGORIEN.find(k=>k.id===ergebnis.kategorie_id)||KATEGORIEN[8]).label}/
               </div>
             </div>
           )}
@@ -300,10 +473,12 @@ function DokumentHub() {
       {ansicht === "onedrive" && (
         <div style={{ padding: 20 }}>
           <div style={{ fontFamily: "'Newsreader', serif", fontSize: 18, fontWeight: 700, marginBottom: 14 }}>OneDrive-Verbindung</div>
-
-          {odStatus === "verbunden" && odUser ? (
-            <div style={{ background: "#EAF2EE", color: "#2E6F5E", padding: 12, borderRadius: 8, fontSize: 13.5 }}>
-              ✓ Verbunden als {odUser.displayName || odUser.userPrincipalName}
+          {odStatus === "verbunden" && odUser && !tokenAbgelaufen ? (
+            <div>
+              <div style={{ background: "#EAF2EE", color: "#2E6F5E", padding: 12, borderRadius: 8, fontSize: 13.5, marginBottom: 10 }}>
+                ✓ Verbunden als {odUser.displayName || odUser.userPrincipalName}
+              </div>
+              {odAblaufZeit && <div style={{ fontSize: 12, color: "#9A9484" }}>Anmeldung gültig bis {new Date(odAblaufZeit).toLocaleTimeString("de-DE")} Uhr</div>}
             </div>
           ) : (
             <div>
@@ -329,24 +504,32 @@ function DokumentHub() {
           <div style={{ background: "#fff", margin: "0 16px 16px", borderRadius: "0 12px 12px 12px", border: "1px solid #E4E1D6", overflow: "hidden" }}>
             {gefiltertesArchiv.length === 0 ? (
               <div style={{ padding: 40, textAlign: "center", color: "#9A9484", fontSize: 13.5 }}>Noch keine Dokumente abgelegt.</div>
-            ) : gefiltertesArchiv.map(e => (
-              <div key={e.id} style={{ display: "flex", gap: 12, padding: "14px 16px", borderBottom: "1px solid #F0EEE4", alignItems: "center" }}>
-                <img src={e.previewUrl} alt="" style={{ width: 44, height: 44, objectFit: "cover", borderRadius: 6, border: "1px solid #E4E1D6" }} />
-                <div style={{ flex: 1, minWidth: 0 }}>
-                  <div className="mono" style={{ fontSize: 12.5, fontWeight: 500, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{e.dateiname}</div>
-                  <div style={{ fontSize: 11.5, color: "#9A9484", marginTop: 2 }}>{e.pfad}</div>
-                  {e.oneDriveStatus && (
-                    <div style={{ fontSize: 10.5, marginTop: 3, fontWeight: 600, color: e.oneDriveStatus === "ok" ? "#2E6F5E" : e.oneDriveStatus === "fehler" ? "#B23A34" : e.oneDriveStatus === "laedt_hoch" ? "#D98E3F" : "#9A9484" }}>
-                      {e.oneDriveStatus === "ok" && "✓ OneDrive"}
-                      {e.oneDriveStatus === "fehler" && "✗ Upload fehlgeschlagen"}
-                      {e.oneDriveStatus === "laedt_hoch" && "… lädt hoch"}
-                      {e.oneDriveStatus === "nicht_verbunden" && "nur lokal"}
+            ) : gefiltertesArchiv.map(e => {
+              const tage = tageBisFaelligkeit(e.faelligkeitsdatum);
+              return (
+                <div key={e.id} style={{ display: "flex", gap: 12, padding: "14px 16px", borderBottom: "1px solid #F0EEE4", alignItems: "flex-start" }}>
+                  <img src={e.previewUrl} alt="" style={{ width: 44, height: 44, objectFit: "cover", borderRadius: 6, border: "1px solid #E4E1D6", flexShrink: 0 }} />
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div className="mono" style={{ fontSize: 12.5, fontWeight: 500, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{e.dateiname}</div>
+                    <div style={{ fontSize: 11.5, color: "#9A9484", marginTop: 2 }}>{e.pfad}</div>
+                    <div style={{ display: "flex", flexWrap: "wrap", gap: 5, marginTop: 5 }}>
+                      {e.oneDriveStatus === "ok" && <Badge color="#2E6F5E" bg="#EAF2EE">✓ OneDrive</Badge>}
+                      {e.oneDriveStatus === "laedt_hoch" && <Badge color="#8A5A1F" bg="#FCEFDD">… lädt hoch</Badge>}
+                      {e.oneDriveStatus === "nicht_verbunden" && <Badge color="#7A7566" bg="#EDEAE1">nur lokal</Badge>}
+                      {e.oneDriveStatus === "fehler" && (
+                        <span onClick={() => erneutHochladen(e)} style={{ cursor: "pointer" }}>
+                          <Badge color="#B23A34" bg="#FBEAE8">✗ fehlgeschlagen · erneut versuchen</Badge>
+                        </span>
+                      )}
+                      {e.ist_wiederkehrend && <Badge color="#3E5C76" bg="#EAF0FA">🔁 wiederkehrend</Badge>}
+                      {tage != null && tage <= 14 && <Badge color={tage < 0 ? "#B23A34" : "#8A5A1F"} bg={tage < 0 ? "#FBEAE8" : "#FCEFDD"}>{tage < 0 ? `überfällig seit ${Math.abs(tage)}T` : tage === 0 ? "heute fällig" : `fällig in ${tage}T`}</Badge>}
+                      {e.konfidenz != null && e.konfidenz < 0.6 && <Badge color="#8A5A1F" bg="#FCEFDD">⚠ prüfen</Badge>}
                     </div>
-                  )}
+                  </div>
+                  <span style={{ background: e.kategorie.farbe, color: "#fff", fontSize: 10, fontWeight: 600, padding: "3px 7px", borderRadius: 5, whiteSpace: "nowrap", flexShrink: 0 }}>{e.kategorie.label}</span>
                 </div>
-                <span style={{ background: e.kategorie.farbe, color: "#fff", fontSize: 10, fontWeight: 600, padding: "3px 7px", borderRadius: 5, whiteSpace: "nowrap" }}>{e.kategorie.label}</span>
-              </div>
-            ))}
+              );
+            })}
           </div>
         </div>
       )}
