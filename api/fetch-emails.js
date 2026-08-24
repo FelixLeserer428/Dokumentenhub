@@ -8,6 +8,7 @@ import { simpleParser } from "mailparser";
 
 const DOKUMENT_ENDUNGEN = /\.(pdf|jpe?g|png|heic)$/i;
 const DOKUMENT_MIMETYPEN = /pdf|jpe?g|jpg|png|heic/i;
+const SIGNATUR_BILD_MUSTER = /^image\d{0,4}\.(png|jpe?g|gif)$/i;
 
 async function findeOrdner(client, muster) {
   const alle = await client.list();
@@ -36,9 +37,13 @@ async function leseAnhaengeAusOrdner(client, ordnerPfad, suchKriterium, quelle) 
         parsed = await simpleParser(msg.source);
       } catch { continue; }
 
-      const anhaenge = (parsed.attachments || []).filter(
-        (a) => DOKUMENT_MIMETYPEN.test(a.contentType || "") || DOKUMENT_ENDUNGEN.test(a.filename || "")
-      );
+      const anhaenge = (parsed.attachments || []).filter((a) => {
+        const istEchterAnhang = a.contentDisposition !== "inline" && !a.related;
+        const passtTyp = DOKUMENT_MIMETYPEN.test(a.contentType || "") || DOKUMENT_ENDUNGEN.test(a.filename || "");
+        const ausreichendGross = (a.size || (a.content ? a.content.length : 0)) > 25 * 1024; // Logos/Icons sind fast immer kleiner als 25 KB
+        const keinSignaturBild = !SIGNATUR_BILD_MUSTER.test(a.filename || "");
+        return istEchterAnhang && passtTyp && ausreichendGross && keinSignaturBild;
+      });
       for (const a of anhaenge) {
         treffer.push({
           quelle,
