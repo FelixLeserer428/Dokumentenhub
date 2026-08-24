@@ -17,6 +17,7 @@
 <script crossorigin src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"></script>
 <script crossorigin src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
 <script src="https://unpkg.com/@babel/standalone@7.24.7/babel.min.js"></script>
+<script src="https://unpkg.com/jspdf@2.5.1/dist/jspdf.umd.min.js"></script>
 
 <style>
   html, body { margin: 0; padding: 0; background: #F4F3EF; }
@@ -83,6 +84,21 @@ function komprimiereBild(file, maxDim = 1600, qualitaet = 0.82) {
     };
     reader.readAsDataURL(file);
   });
+}
+
+function erzeugePdfAusSeiten(seitenListe) {
+  const { jsPDF } = window.jspdf;
+  const pdf = new jsPDF({ unit: "pt", format: "a4" });
+  seitenListe.forEach((seite, i) => {
+    if (i > 0) pdf.addPage();
+    const props = pdf.getImageProperties(seite.previewUrl);
+    const pageW = pdf.internal.pageSize.getWidth();
+    const pageH = pdf.internal.pageSize.getHeight();
+    const ratio = Math.min(pageW / props.width, pageH / props.height);
+    const w = props.width * ratio, h = props.height * ratio;
+    pdf.addImage(seite.previewUrl, "JPEG", (pageW - w) / 2, (pageH - h) / 2, w, h);
+  });
+  return pdf.output("blob");
 }
 
 function b64ToBlob(base64, mediaType) {
@@ -214,12 +230,13 @@ function DokumentHub() {
   const [ansicht, setAnsicht] = useState("scan");
   const [status, setStatus] = useState("idle");
   const [fehler, setFehler] = useState(null);
-  const [bildDaten, setBildDaten] = useState(null);
+  const [seiten, setSeiten] = useState([]); // [{base64, mediaType, previewUrl}]
   const [ergebnis, setErgebnis] = useState(null);
   const [weitereFelderOffen, setWeitereFelderOffen] = useState(false);
   const [archiv, setArchiv] = useState(() => ladeArchivAusSpeicher());
   const [filterKat, setFilterKat] = useState(null);
   const fileInputRef = useRef(null);
+  const weitereSeiteRef = useRef(null);
 
   const [clientId, setClientId] = useState(() => window.localStorage.getItem("dh_client_id") || "");
   const [odToken, setOdToken] = useState(null);
@@ -257,16 +274,16 @@ function DokumentHub() {
   const tokenLaeuftBaldAb = odAblaufZeit && (odAblaufZeit - jetzt) < 5 * 60 * 1000 && (odAblaufZeit - jetzt) > 0;
   const tokenAbgelaufen = odAblaufZeit && jetzt >= odAblaufZeit;
 
-  const handleDatei = useCallback((file) => {
+  const handleErsteSeite = useCallback((file) => {
     if (!file) return;
-    setFehler(null); setErgebnis(null); setWeitereFelderOffen(false);
+    setFehler(null); setErgebnis(null); setWeitereFelderOffen(false); setSeiten([]);
     setStatus("komprimiere"); setAnsicht("pruefen");
     komprimiereBild(file)
-      .then(async ({ base64, mediaType, previewUrl }) => {
-        setBildDaten({ base64, mediaType, previewUrl });
+      .then(async (seite) => {
+        setSeiten([seite]);
         setStatus("analysiere");
         try {
-          const analyse = await analysiereBeleg(base64, mediaType);
+          const analyse = await analysiereBeleg(seite.base64, seite.mediaType);
           setErgebnis(analyse); setStatus("fertig");
         } catch (e) {
           setFehler("Analyse fehlgeschlagen: " + e.message);
@@ -280,19 +297,29 @@ function DokumentHub() {
       });
   }, []);
 
+  const handleWeitereSeite = useCallback((file) => {
+    if (!file) return;
+    setStatus("komprimiere_seite");
+    komprimiereBild(file)
+      .then((seite) => { setSeiten(prev => [...prev, seite]); setStatus("fertig"); })
+      .catch((e) => { setFehler("Seite konnte nicht hinzugefügt werden: " + e.message); setStatus("fertig"); });
+  }, []);
+
   const eindeutigerDateiname = (basisname) => {
     const vorhandene = new Set(archiv.map(e => e.dateiname));
+    const punkt = basisname.lastIndexOf(".");
+    const stamm = punkt !== -1 ? basisname.slice(0, punkt) : basisname;
+    const endung = punkt !== -1 ? basisname.slice(punkt) : "";
     let name = basisname, n = 2;
-    while (vorhandene.has(name)) { name = basisname.replace(/\.jpg$/, `-${n}.jpg`); n++; }
+    while (vorhandene.has(name)) { name = `${stamm}-${n}${endung}`; n++; }
     return name;
   };
 
-  const ladeHoch = async (eintrag, bildBase64) => {
+  const ladeHoch = async (eintrag, blob) => {
     try {
       const kat = eintrag.kategorie;
       const jahr = (eintrag.datum || heute()).slice(0,4);
       await stelleOrdnerpfadSicher(odToken, jahr, kat.label);
-      const blob = b64ToBlob(bildBase64, "image/jpeg");
       await uploadZuOneDrive(odToken, eintrag.pfad, eintrag.dateiname, blob);
       setArchiv(prev => prev.map(e => e.id === eintrag.id ? { ...e, oneDriveStatus: "ok" } : e));
     } catch (e) {
@@ -301,27 +328,43 @@ function DokumentHub() {
   };
 
   const jetztAblegen = async () => {
-    if (!ergebnis) return;
+    if (!ergebnis || seiten.length === 0) return;
     const kat = KATEGORIEN.find(k => k.id === ergebnis.kategorie_id) || KATEGORIEN[8];
     const jahr = (ergebnis.datum || heute()).slice(0,4);
-    const dateiname = eindeutigerDateiname(slugify(ergebnis.vorgeschlagener_dateiname) + ".jpg");
+
+    let blob, endung;
+    try {
+      blob = erzeugePdfAusSeiten(seiten);
+      endung = "pdf";
+    } catch (e) {
+      blob = b64ToBlob(seiten[0].base64, "image/jpeg");
+      endung = "jpg";
+    }
+
+    const dateiname = eindeutigerDateiname(`${slugify(ergebnis.vorgeschlagener_dateiname)}.${endung}`);
     const pfad = `DokumentHub/${jahr}/${kat.label}/`;
     const id = Date.now();
-    const eintrag = { id, ...ergebnis, kategorie: kat, dateiname, previewUrl: bildDaten.previewUrl, pfad, abgelegtAm: new Date().toLocaleString("de-DE"), oneDriveStatus: odStatus === "verbunden" ? "laedt_hoch" : "nicht_verbunden" };
+    const eintrag = { id, ...ergebnis, kategorie: kat, dateiname, previewUrl: seiten[0].previewUrl, seitenDaten: seiten, seitenAnzahl: seiten.length, pfad, abgelegtAm: new Date().toLocaleString("de-DE"), oneDriveStatus: odStatus === "verbunden" ? "laedt_hoch" : "nicht_verbunden" };
     setArchiv(prev => [eintrag, ...prev]);
-    const base64Lokal = bildDaten.base64;
-    setBildDaten(null); setErgebnis(null); setStatus("idle"); setAnsicht("archiv");
-    if (odStatus === "verbunden" && odToken) await ladeHoch(eintrag, base64Lokal);
+    setSeiten([]); setErgebnis(null); setStatus("idle"); setAnsicht("archiv");
+    if (odStatus === "verbunden" && odToken) await ladeHoch(eintrag, blob);
   };
 
   const erneutHochladen = (eintrag) => {
     if (odStatus !== "verbunden" || !odToken) { setAnsicht("onedrive"); return; }
     setArchiv(prev => prev.map(e => e.id === eintrag.id ? { ...e, oneDriveStatus: "laedt_hoch" } : e));
-    const base64 = eintrag.previewUrl.split(",")[1];
-    ladeHoch(eintrag, base64);
+    let blob;
+    try {
+      blob = eintrag.dateiname.endsWith(".pdf") && eintrag.seitenDaten
+        ? erzeugePdfAusSeiten(eintrag.seitenDaten)
+        : b64ToBlob(eintrag.previewUrl.split(",")[1], "image/jpeg");
+    } catch (e) {
+      blob = b64ToBlob(eintrag.previewUrl.split(",")[1], "image/jpeg");
+    }
+    ladeHoch(eintrag, blob);
   };
 
-  const verwerfen = () => { setBildDaten(null); setErgebnis(null); setStatus("idle"); setFehler(null); setAnsicht("scan"); };
+  const verwerfen = () => { setSeiten([]); setErgebnis(null); setStatus("idle"); setFehler(null); setAnsicht("scan"); };
 
   const gefiltertesArchiv = filterKat ? archiv.filter(e => e.kategorie.id === filterKat) : archiv;
 
@@ -364,7 +407,7 @@ function DokumentHub() {
             <div style={{ fontSize: 40, marginBottom: 12 }}>📄</div>
             <div style={{ fontWeight: 600, marginBottom: 6, fontSize: 15 }}>Dokument fotografieren</div>
             <div style={{ fontSize: 13, color: "#9A9484", marginBottom: 20 }}>JPG, PNG, HEIC · wird automatisch komprimiert</div>
-            <input ref={fileInputRef} type="file" accept="image/*" capture="environment" style={{ display: "none" }} onChange={e => handleDatei(e.target.files[0])} />
+            <input ref={fileInputRef} type="file" accept="image/*" capture="environment" style={{ display: "none" }} onChange={e => handleErsteSeite(e.target.files[0])} />
             <button className="btn-primary" onClick={() => fileInputRef.current?.click()}>Kamera öffnen</button>
           </div>
         </div>
@@ -372,7 +415,29 @@ function DokumentHub() {
 
       {ansicht === "pruefen" && (
         <div style={{ padding: 20 }}>
-          {bildDaten && <img src={bildDaten.previewUrl} alt="Scan" style={{ width: "100%", borderRadius: 12, marginBottom: 16, border: "1px solid #E4E1D6" }} />}
+          {seiten.length > 0 && (
+            <div>
+              <div style={{ display: "flex", gap: 8, overflowX: "auto", paddingBottom: 4, marginBottom: 8 }}>
+                {seiten.map((s, i) => (
+                  <div key={i} style={{ position: "relative", flexShrink: 0 }}>
+                    <img src={s.previewUrl} alt={`Seite ${i+1}`} style={{ width: 84, height: 108, objectFit: "cover", borderRadius: 8, border: "1px solid #E4E1D6" }} />
+                    <span style={{ position: "absolute", bottom: 4, right: 4, background: "rgba(22,35,61,0.85)", color: "#fff", fontSize: 10, fontWeight: 700, padding: "1px 5px", borderRadius: 4 }}>{i+1}</span>
+                  </div>
+                ))}
+                {status === "fertig" && (
+                  <input ref={weitereSeiteRef} type="file" accept="image/*" capture="environment" style={{ display: "none" }} onChange={e => { handleWeitereSeite(e.target.files[0]); e.target.value = ""; }} />
+                )}
+                {status === "fertig" && (
+                  <button onClick={() => weitereSeiteRef.current?.click()} style={{
+                    width: 84, height: 108, flexShrink: 0, border: "2px dashed #C9C4B4", borderRadius: 8, background: "#FBFAF7",
+                    color: "#7A7566", fontSize: 24, cursor: "pointer",
+                  }}>+</button>
+                )}
+              </div>
+              {seiten.length > 1 && <div style={{ fontSize: 12, color: "#7A7566", marginBottom: 12 }}>{seiten.length} Seiten werden zu einer PDF zusammengefügt</div>}
+              {status === "komprimiere_seite" && <div style={{ fontSize: 12, color: "#7A7566", marginBottom: 12 }} className="mono">Seite wird hinzugefügt …</div>}
+            </div>
+          )}
 
           {(status === "komprimiere" || status === "analysiere") && (
             <div style={{ textAlign: "center", padding: "36px 0" }}>
@@ -392,9 +457,9 @@ function DokumentHub() {
                   ⚠ Niedrige Erkennungssicherheit ({Math.round(ergebnis.konfidenz * 100)}%) – bitte Angaben genau prüfen.
                 </div>
               )}
-              {ergebnis.mehrseiten_hinweis && (
+              {ergebnis.mehrseiten_hinweis && seiten.length === 1 && (
                 <div style={{ background: "#EAF0FA", color: "#2E4F7A", padding: 10, borderRadius: 8, fontSize: 12.5, marginBottom: 14 }}>
-                  📄 {ergebnis.mehrseiten_hinweis} erkannt – ggf. fehlen weitere Seiten dieses Dokuments.
+                  📄 {ergebnis.mehrseiten_hinweis} erkannt – füg die fehlenden Seiten oben mit "+" hinzu, bevor du ablegst.
                 </div>
               )}
 
@@ -463,7 +528,7 @@ function DokumentHub() {
                 <button className="btn-primary" onClick={jetztAblegen}>In Archiv ablegen</button>
               </div>
               <div style={{ fontSize: 11.5, color: "#9A9484", marginTop: 10, textAlign: "center" }}>
-                Wird abgelegt: OneDrive/DokumentHub/{(ergebnis.datum || heute()).slice(0,4)}/{(KATEGORIEN.find(k=>k.id===ergebnis.kategorie_id)||KATEGORIEN[8]).label}/
+                Wird als PDF abgelegt: OneDrive/DokumentHub/{(ergebnis.datum || heute()).slice(0,4)}/{(KATEGORIEN.find(k=>k.id===ergebnis.kategorie_id)||KATEGORIEN[8]).label}/
               </div>
             </div>
           )}
@@ -524,6 +589,7 @@ function DokumentHub() {
                       {e.ist_wiederkehrend && <Badge color="#3E5C76" bg="#EAF0FA">🔁 wiederkehrend</Badge>}
                       {tage != null && tage <= 14 && <Badge color={tage < 0 ? "#B23A34" : "#8A5A1F"} bg={tage < 0 ? "#FBEAE8" : "#FCEFDD"}>{tage < 0 ? `überfällig seit ${Math.abs(tage)}T` : tage === 0 ? "heute fällig" : `fällig in ${tage}T`}</Badge>}
                       {e.konfidenz != null && e.konfidenz < 0.6 && <Badge color="#8A5A1F" bg="#FCEFDD">⚠ prüfen</Badge>}
+                      {e.seitenAnzahl > 1 && <Badge color="#7A7566" bg="#EDEAE1">📄 {e.seitenAnzahl} Seiten</Badge>}
                     </div>
                   </div>
                   <span style={{ background: e.kategorie.farbe, color: "#fff", fontSize: 10, fontWeight: 600, padding: "3px 7px", borderRadius: 5, whiteSpace: "nowrap", flexShrink: 0 }}>{e.kategorie.label}</span>
