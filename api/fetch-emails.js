@@ -14,7 +14,7 @@ async function findeOrdner(client, muster) {
   return alle.find((o) => muster.test(o.path) || muster.test(o.name));
 }
 
-async function leseAnhaengeAusOrdner(client, ordnerPfad, seit, quelle) {
+async function leseAnhaengeAusOrdner(client, ordnerPfad, suchKriterium, quelle) {
   const treffer = [];
   let lock;
   try {
@@ -23,7 +23,7 @@ async function leseAnhaengeAusOrdner(client, ordnerPfad, seit, quelle) {
     return treffer; // Ordner existiert nicht / kein Zugriff -> überspringen
   }
   try {
-    const uids = await client.search({ since: seit }, { uid: true });
+    const uids = await client.search(suchKriterium, { uid: true });
     for (const uid of uids || []) {
       let msg;
       try {
@@ -68,8 +68,10 @@ export default async function handler(req, res) {
     return res.status(500).json({ error: "IMAP_USER / IMAP_PASSWORD sind auf dem Server nicht gesetzt" });
   }
 
-  const { seitDatum } = req.body || {};
-  const seit = seitDatum ? new Date(seitDatum) : new Date(Date.now() - 7 * 24 * 3600 * 1000);
+  const { seitDatum, von, bis } = req.body || {};
+  const seit = von ? new Date(von) : (seitDatum ? new Date(seitDatum) : new Date(Date.now() - 7 * 24 * 3600 * 1000));
+  const vor = bis ? new Date(bis) : null;
+  const suchKriterium = vor ? { since: seit, before: vor } : { since: seit };
 
   const client = new ImapFlow({
     host: "imap.1und1.de",
@@ -84,9 +86,9 @@ export default async function handler(req, res) {
 
     const gesendetOrdner = await findeOrdner(client, /sent|gesendet/i);
 
-    const posteingang = await leseAnhaengeAusOrdner(client, "INBOX", seit, "posteingang");
+    const posteingang = await leseAnhaengeAusOrdner(client, "INBOX", suchKriterium, "posteingang");
     const gesendet = gesendetOrdner
-      ? await leseAnhaengeAusOrdner(client, gesendetOrdner.path, seit, "gesendet")
+      ? await leseAnhaengeAusOrdner(client, gesendetOrdner.path, suchKriterium, "gesendet")
       : [];
 
     await client.logout();
