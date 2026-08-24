@@ -1,0 +1,7 @@
+{
+  "functions": {
+    "api/fetch-emails.js": {
+      "maxDuration": 60
+    }
+  }
+}
