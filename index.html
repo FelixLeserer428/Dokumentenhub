@@ -376,6 +376,10 @@ function DokumentHub() {
     if (odStatus === "verbunden" && odToken) await ladeHoch(eintrag, blob);
   };
 
+  const eintragLoeschen = (id) => {
+    setArchiv(prev => prev.filter(e => e.id !== id));
+  };
+
   const erneutHochladen = (eintrag) => {
     if (odStatus !== "verbunden" || !odToken) { setAnsicht("onedrive"); return; }
     setArchiv(prev => prev.map(e => e.id === eintrag.id ? { ...e, oneDriveStatus: "laedt_hoch" } : e));
@@ -848,7 +852,10 @@ function DokumentHub() {
                       {e.ausEmail && <Badge color="#6B4226" bg="#F5EDE3">✉ aus E-Mail</Badge>}
                     </div>
                   </div>
-                  <span style={{ background: e.kategorie.farbe, color: "#fff", fontSize: 10, fontWeight: 600, padding: "3px 7px", borderRadius: 5, whiteSpace: "nowrap", flexShrink: 0 }}>{e.kategorie.label}</span>
+                  <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 6, flexShrink: 0 }}>
+                    <span style={{ background: e.kategorie.farbe, color: "#fff", fontSize: 10, fontWeight: 600, padding: "3px 7px", borderRadius: 5, whiteSpace: "nowrap" }}>{e.kategorie.label}</span>
+                    <button onClick={() => { if (window.confirm(`"${e.dateiname}" aus dem Archiv entfernen? (Datei bleibt in OneDrive erhalten, falls schon hochgeladen)`)) eintragLoeschen(e.id); }} style={{ background: "none", border: "none", color: "#B0AA98", fontSize: 16, cursor: "pointer", padding: 2, lineHeight: 1 }}>✕</button>
+                  </div>
                 </div>
               );
             })}
